@@ -13,9 +13,10 @@ import pyrender
 import rospy
 import trimesh
 from cv_bridge import CvBridge, CvBridgeError
+from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image as ROSImage
-from std_msgs.msg import Bool, Header
+from std_msgs.msg import Bool
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import (
@@ -252,8 +253,8 @@ class FoundationPoseROS:
         )
 
         # Publisher for the object pose
-        self.pose_pub = rospy.Publisher("/object_pose", ROSImage, queue_size=10)
-        self.predicted_mask_pub = rospy.Publisher("/fp_mask", ROSImage, queue_size=10)
+        self.pose_pub = rospy.Publisher("/object_pose", Pose, queue_size=1)
+        self.predicted_mask_pub = rospy.Publisher("/fp_mask", ROSImage, queue_size=1)
 
     def update_images(self, predicted_depth, predicted_mask):
         self.ax_depth.set_data(predicted_depth)
@@ -478,17 +479,20 @@ class FoundationPoseROS:
         )
         return mask
 
-    def publish_pose(self, pose):
+    def publish_pose(self, pose: np.ndarray):
+        assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
+        trans = pose[:3, 3]
+        quat_xyzw = R.from_matrix(pose[:3, :3]).as_quat()
+
         # Convert the pose matrix into a ROS message
-        pose_msg = ROSImage()
-        pose_msg.header = Header(stamp=rospy.Time.now())
-        pose_msg.encoding = "rgb8"
-        pose_msg.height = 1
-        pose_msg.width = 4
-        pose_msg.data = pose.flatten().tolist()
+        msg = Pose()
+        msg.position.x, msg.position.y, msg.position.z = trans
+        msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = (
+            quat_xyzw
+        )
 
         # Publish the pose
-        self.pose_pub.publish(pose_msg)
+        self.pose_pub.publish(msg)
         rospy.logdebug("Pose published to /object_pose")
 
 
@@ -502,7 +506,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--est_refine_iter", type=int, default=5)
     parser.add_argument("--track_refine_iter", type=int, default=2)
-    parser.add_argument("--debug", type=int, default=3)
+    parser.add_argument("--debug", type=int, default=0)
     parser.add_argument("--debug_dir", type=str, default=f"{code_dir}/debug")
     args = parser.parse_args()
 
