@@ -278,167 +278,180 @@ class FoundationPoseROS:
             rospy.logerr(f"Could not convert mask image: {e}")
 
     def run(self):
-        while not rospy.is_shutdown():
-            self.process_images()
-
-    def process_images(self):
-        if (
+        ##############################
+        # Wait for the first images
+        ##############################
+        while (
             self.latest_rgb is None
             or self.latest_depth is None
             or self.latest_mask is None
         ):
-            rospy.logwarn(
+            rospy.loginfo(
                 "Missing one of the required images (RGB, depth, mask). Waiting..."
             )
-            return
+            rospy.sleep(0.1)
 
-        logging.info(f"Processing frame: {self.frame_count}")
-        rgb = self.process_rgb(self.latest_rgb)
-        depth = self.process_depth(self.latest_depth)
-        mask = self.process_mask(self.latest_mask)
-        rospy.loginfo(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
-        rospy.loginfo(
-            f"depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
-        )
-        rospy.loginfo(
-            f"mask: {mask.shape}, {mask.dtype}, {np.max(mask)}, {np.min(mask)}"
-        )
+        assert self.latest_rgb is not None
+        assert self.latest_depth is not None
+        assert self.latest_mask is not None
+
+        ##############################
+        # Run first time
+        ##############################
+        rospy.loginfo("Running the first frame")
+
+        first_rgb = self.process_rgb(self.latest_rgb)
+        first_depth = self.process_depth(self.latest_depth)
+        first_mask = self.process_mask(self.latest_mask)
 
         # Estimation and tracking
         if self.frame_count == 0:  # Slow 1Hz mask generation + estimation
+            t0 = time.time()
             pose = self.FPModel.register(
                 K=self.cam_K,
-                rgb=rgb,
-                depth=depth,
-                ob_mask=mask,
+                rgb=first_rgb,
+                depth=first_depth,
+                ob_mask=first_mask,
                 iteration=self.est_refine_iter,
             )
+            rospy.loginfo(f"time for reg mask is = {(time.time() - t0)*1000} ms")
             logging.info("First frame estimation done")
-            rospy.logerr(f"pose.shape = {pose.shape}")
-            rospy.logerr(f"pose = {pose}")
+            assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
 
             if self.debug >= 3:
                 m = self.object_mesh.copy()
                 m.apply_transform(pose)
                 m.export(f"{self.debug_dir}/model_tf.obj")
-                xyz_map = depth2xyzmap(depth, self.cam_K)
-                valid = depth >= 0.001
-                pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
-                o3d.io.write_point_cloud(f"{self.debug_dir}/scene_complete.ply", pcd)
+                xyz_map = depth2xyzmap(first_depth, self.cam_K)
+                valid = first_depth >= 0.001
+                pcd = toOpen3dCloud(xyz_map[valid], first_rgb[valid])
+                pcd_path = f"{self.debug_dir}/scene_complete.ply"
+                o3d.io.write_point_cloud(pcd_path, pcd)
+                rospy.loginfo(f"Point cloud saved to {pcd_path}")
+
+        ##############################
+        # Track
+        ##############################
+        while not rospy.is_shutdown():
+            start_time = rospy.Time.now()
+
+            logging.info(f"Processing frame: {self.frame_count}")
+            rgb = self.process_rgb(self.latest_rgb)
+            depth = self.process_depth(self.latest_depth)
+            mask = self.process_mask(self.latest_mask)
 
             t0 = time.time()
-            predicted_depth, predicted_mask = render_depth_and_mask_cache(
-                self.object_mesh, pose, self.cam_K, image_width=640, image_height=480
-            )
-            rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
-
-        else:  # Fast 30Hz tracking
             pose = self.FPModel.track_one(
                 rgb=rgb, depth=depth, K=self.cam_K, iteration=self.track_refine_iter
             )
+            rospy.loginfo(f"time for track is = {(time.time() - t0)*1000} ms")
 
-            rospy.logerr(f"pose.shape = {pose.shape}")
-            rospy.logerr(f"pose = {pose}")
-            t0 = time.time()
-            predicted_depth, predicted_mask = render_depth_and_mask_cache(
-                self.object_mesh, pose, self.cam_K, image_width=640, image_height=480
-            )
-            rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
+            # t0 = time.time()
+            # predicted_depth, predicted_mask = render_depth_and_mask_cache(
+            #     self.object_mesh, pose, self.cam_K, image_width=640, image_height=480
+            # )
+            # rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
+            # iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
 
-            iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
+            # is_match = True  # HACK
+            # rospy.logerr("=" * 100)
+            # rospy.logerr(f"IoU: {iou}")
+            # if is_match:
+            #     rospy.logerr("Masks match within the threshold.")
+            # else:
+            #     rospy.logerr("Masks do not match within the threshold.")
 
-            is_match = True  # HACK
-            rospy.logerr("=" * 100)
-            rospy.logerr(f"IoU: {iou}")
-            if is_match:
-                rospy.logerr("Masks match within the threshold.")
-            else:
-                rospy.logerr("Masks do not match within the threshold.")
+            #     # pose = self.FPModel.register(K=self.cam_K, rgb=rgb, depth=depth, ob_mask=mask, iteration=self.est_refine_iter)
+            #     pose = self.FPModel.register(
+            #         K=self.cam_K,
+            #         rgb=rgb,
+            #         depth=depth,
+            #         ob_mask=self.process_mask(self.latest_mask),
+            #         iteration=self.est_refine_iter,
+            #     )
 
-                # pose = self.FPModel.register(K=self.cam_K, rgb=rgb, depth=depth, ob_mask=mask, iteration=self.est_refine_iter)
-                pose = self.FPModel.register(
+            #     logging.info("First frame estimation done")
+
+            #     t0 = time.time()
+            #     predicted_depth, predicted_mask = render_depth_and_mask_cache(
+            #         self.object_mesh,
+            #         pose,
+            #         self.cam_K,
+            #         image_width=640,
+            #         image_height=480,
+            #     )
+            #     rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
+
+            #     if self.debug >= 3:
+            #         m = self.object_mesh.copy()
+            #         m.apply_transform(pose)
+            #         m.export(f"{self.debug_dir}/model_tf.obj")
+            #         xyz_map = depth2xyzmap(depth, self.cam_K)
+            #         valid = depth >= 0.001
+            #         pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
+            #         o3d.io.write_point_cloud(
+            #             f"{self.debug_dir}/scene_complete.ply", pcd
+            #         )
+
+            # rospy.logerr("=" * 100)
+
+            # # Convert OpenCV image (mask) to ROS Image message
+            # mask_msg = self.bridge.cv2_to_imgmsg(
+            #     predicted_mask.astype(np.uint8) * 255, encoding="8UC1"
+            # )
+            # mask_msg.header = Header(stamp=rospy.Time.now())
+
+            # # Publish the mask to the /sam2_mask topic
+            # self.predicted_mask_pub.publish(mask_msg)
+            rospy.loginfo("Predicted mask published to /fp_mask")
+
+            # Publish pose
+            self.publish_pose(pose)
+
+            if self.debug >= 1:
+                center_pose = pose @ np.linalg.inv(self.to_origin)
+                vis_img = rgb.copy()
+
+                # Must be BGR for cv2
+                vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
+
+                vis_img = draw_posed_3d_box(
+                    self.cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
+                )
+                vis_img = draw_xyz_axis(
+                    vis_img,
+                    ob_in_cam=center_pose,
+                    scale=0.1,
                     K=self.cam_K,
-                    rgb=rgb,
-                    depth=depth,
-                    ob_mask=self.process_mask(self.latest_mask),
-                    iteration=self.est_refine_iter,
+                    thickness=3,
+                    transparency=0,
+                    is_input_rgb=True,
                 )
 
-                logging.info("First frame estimation done")
-                rospy.logerr(f"pose.shape = {pose.shape}")
-                rospy.logerr(f"pose = {pose}")
+                cv2.imshow("Pose Visualization", vis_img)
+                cv2.waitKey(1)
 
-                t0 = time.time()
-                predicted_depth, predicted_mask = render_depth_and_mask_cache(
-                    self.object_mesh,
-                    pose,
-                    self.cam_K,
-                    image_width=640,
-                    image_height=480,
-                )
-                rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
+            self.frame_count += 1
 
-                if self.debug >= 3:
-                    m = self.object_mesh.copy()
-                    m.apply_transform(pose)
-                    m.export(f"{self.debug_dir}/model_tf.obj")
-                    xyz_map = depth2xyzmap(depth, self.cam_K)
-                    valid = depth >= 0.001
-                    pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
-                    o3d.io.write_point_cloud(
-                        f"{self.debug_dir}/scene_complete.ply", pcd
-                    )
-
-            rospy.logerr("=" * 100)
-
-        # Convert OpenCV image (mask) to ROS Image message
-        mask_msg = self.bridge.cv2_to_imgmsg(
-            predicted_mask.astype(np.uint8) * 255, encoding="8UC1"
-        )
-        mask_msg.header = Header(stamp=rospy.Time.now())
-
-        # Publish the mask to the /sam2_mask topic
-        self.predicted_mask_pub.publish(mask_msg)
-        rospy.loginfo("Predicted mask published to /fp_mask")
-
-        # Publish pose
-        self.publish_pose(pose)
-
-        if self.debug >= 1:
-            center_pose = pose @ np.linalg.inv(self.to_origin)
-            vis_img = rgb.copy()
-
-            # Must be BGR for cv2
-            vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
-
-            vis_img = draw_posed_3d_box(
-                self.cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
+            done_time = rospy.Time.now()
+            rospy.loginfo(
+                f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec()*1000)} ms)"
             )
-            vis_img = draw_xyz_axis(
-                vis_img,
-                ob_in_cam=center_pose,
-                scale=0.1,
-                K=self.cam_K,
-                thickness=3,
-                transparency=0,
-                is_input_rgb=True,
-            )
-
-            cv2.imshow("Pose Visualization", vis_img)
-            cv2.waitKey(1)
-
-        self.frame_count += 1
 
     def process_rgb(self, rgb):
         rospy.logdebug(f"rgb.shape = {rgb.shape}")
         rgb = cv2.resize(rgb, (640, 480), interpolation=cv2.INTER_NEAREST)
         rospy.logdebug(f"AFTER rgb.shape = {rgb.shape}")
+        rospy.logdebug(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
         return rgb
 
     def process_depth(self, depth):
         rospy.logdebug(f"depth.shape = {depth.shape}")
         depth = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
         rospy.logdebug(f"AFTER depth.shape = {depth.shape}")
+        rospy.logdebug(
+            f"depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
+        )
         depth = depth / 1000
 
         depth[depth < 0.1] = 0
@@ -452,6 +465,9 @@ class FoundationPoseROS:
             bool
         )
         rospy.logdebug(f"AFTER mask.shape = {mask.shape}")
+        rospy.logdebug(
+            f"mask: {mask.shape}, {mask.dtype}, {np.max(mask)}, {np.min(mask)}"
+        )
         return mask
 
     def publish_pose(self, pose):
