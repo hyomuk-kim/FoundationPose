@@ -35,7 +35,10 @@ def compare_masks(mask1, mask2, threshold=0.2):
 
     # Handle the case where union is zero to avoid division by zero
     if union == 0:
-        return 1.0 if intersection == 0 else 0.0
+        if intersection == 0:
+            return 1.0, True
+        else:
+            return 0.0, False
 
     # Compute Intersection over Union (IoU)
     iou = intersection / union
@@ -193,7 +196,6 @@ class FoundationPoseROS:
         self.latest_mask = None
         self.frame_count = 0
 
-        self.video_dir = args.test_scene_dir
         self.est_refine_iter = args.est_refine_iter
         self.track_refine_iter = args.track_refine_iter
         self.debug = args.debug
@@ -227,7 +229,10 @@ class FoundationPoseROS:
         logging.info("Estimator initialization done")
 
         # Camera parameters
-        self.cam_K = np.loadtxt(f"{self.video_dir}/cam_K.txt").reshape(3, 3)
+        code_dir = os.path.dirname(os.path.realpath(__file__))
+        cam_K_file = f"{code_dir}/demo_data/blueblock/blueblock_occ_slide/cam_K.txt"
+        rospy.loginfo(f"cam_K_file = {cam_K_file}")
+        self.cam_K = np.loadtxt(cam_K_file).reshape(3, 3)
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
@@ -269,9 +274,12 @@ class FoundationPoseROS:
     def mask_callback(self, data):
         try:
             self.latest_mask = self.bridge.imgmsg_to_cv2(data, "mono8")
-            self.process_images()
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert mask image: {e}")
+
+    def run(self):
+        while not rospy.is_shutdown():
+            self.process_images()
 
     def process_images(self):
         if (
@@ -285,12 +293,10 @@ class FoundationPoseROS:
             return
 
         logging.info(f"Processing frame: {self.frame_count}")
-        color = self.process_color(self.latest_rgb)
+        rgb = self.process_rgb(self.latest_rgb)
         depth = self.process_depth(self.latest_depth)
         mask = self.process_mask(self.latest_mask)
-        rospy.loginfo(
-            f"color: {color.shape}, {color.dtype}, {np.max(color)}, {np.min(color)}"
-        )
+        rospy.loginfo(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
         rospy.loginfo(
             f"depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
         )
@@ -302,7 +308,7 @@ class FoundationPoseROS:
         if self.frame_count == 0:  # Slow 1Hz mask generation + estimation
             pose = self.FPModel.register(
                 K=self.cam_K,
-                rgb=color,
+                rgb=rgb,
                 depth=depth,
                 ob_mask=mask,
                 iteration=self.est_refine_iter,
@@ -317,7 +323,7 @@ class FoundationPoseROS:
                 m.export(f"{self.debug_dir}/model_tf.obj")
                 xyz_map = depth2xyzmap(depth, self.cam_K)
                 valid = depth >= 0.001
-                pcd = toOpen3dCloud(xyz_map[valid], color[valid])
+                pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
                 o3d.io.write_point_cloud(f"{self.debug_dir}/scene_complete.ply", pcd)
 
             t0 = time.time()
@@ -328,7 +334,7 @@ class FoundationPoseROS:
 
         else:  # Fast 30Hz tracking
             pose = self.FPModel.track_one(
-                rgb=color, depth=depth, K=self.cam_K, iteration=self.track_refine_iter
+                rgb=rgb, depth=depth, K=self.cam_K, iteration=self.track_refine_iter
             )
 
             rospy.logerr(f"pose.shape = {pose.shape}")
@@ -349,10 +355,10 @@ class FoundationPoseROS:
             else:
                 rospy.logerr("Masks do not match within the threshold.")
 
-                # pose = self.FPModel.register(K=self.cam_K, rgb=color, depth=depth, ob_mask=mask, iteration=self.est_refine_iter)
+                # pose = self.FPModel.register(K=self.cam_K, rgb=rgb, depth=depth, ob_mask=mask, iteration=self.est_refine_iter)
                 pose = self.FPModel.register(
                     K=self.cam_K,
-                    rgb=color,
+                    rgb=rgb,
                     depth=depth,
                     ob_mask=self.process_mask(self.latest_mask),
                     iteration=self.est_refine_iter,
@@ -363,7 +369,6 @@ class FoundationPoseROS:
                 rospy.logerr(f"pose = {pose}")
 
                 t0 = time.time()
-                # predicted_depth, predicted_mask = render_depth_and_mask(self.object_mesh, pose, self.cam_K, image_width=640, image_height=480)
                 predicted_depth, predicted_mask = render_depth_and_mask_cache(
                     self.object_mesh,
                     pose,
@@ -379,7 +384,7 @@ class FoundationPoseROS:
                     m.export(f"{self.debug_dir}/model_tf.obj")
                     xyz_map = depth2xyzmap(depth, self.cam_K)
                     valid = depth >= 0.001
-                    pcd = toOpen3dCloud(xyz_map[valid], color[valid])
+                    pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
                     o3d.io.write_point_cloud(
                         f"{self.debug_dir}/scene_complete.ply", pcd
                     )
@@ -396,35 +401,21 @@ class FoundationPoseROS:
         self.predicted_mask_pub.publish(mask_msg)
         rospy.loginfo("Predicted mask published to /fp_mask")
 
-        # # USE SAM2 MASK TO GET SCORE AND IGNORE IF BELOW THRESHOLD?
-        # score_threshold = 0.2 # TO TUNE
-        # # center = self.FPModel.guess_translation(depth=depth, mask=mask, K=self.cam_K)
-        # # poses = torch.as_tensor(pose, device='cuda', dtype=torch.float).unsqueeze(dim=0)
-        # # poses[:,:3,3] = torch.as_tensor(center.reshape(1,3), device='cuda')
-        # poses = torch.from_numpy(pose).float().cuda().unsqueeze(dim=0)
-        # diameter = compute_mesh_diameter(model_pts=self.object_mesh.vertices, n_sample=10000)
-        # scores, _ = self.scorer.predict(mesh=self.object_mesh, rgb=color, depth=depth, K=self.cam_K, ob_in_cams=poses.data.cpu().numpy(), glctx=self.glctx, mesh_diameter=diameter, mesh_tensors=make_mesh_tensors(self.object_mesh))
-        # rospy.loginfo("=" * 80)
-        # rospy.loginfo(f"SCORE: {max(scores)} {scores}")
-        # rospy.loginfo("=" * 80)
-
-        # if not hasattr(self, "I"):
-        #     self.I = 0
-        # Image.fromarray(predicted_depth).save(f'predicted_depth_{self.I}.png')  # Save as PNG file
-        # Image.fromarray(predicted_mask).save(f'predicted_mask_{self.I}.png')  # Save as PNG file
-        # rospy.loginfo("SAVED")
-        # self.I += 1
-
         # Publish pose
         self.publish_pose(pose)
 
         if self.debug >= 1:
             center_pose = pose @ np.linalg.inv(self.to_origin)
-            vis = draw_posed_3d_box(
-                self.cam_K, img=color, ob_in_cam=center_pose, bbox=self.bbox
+            vis_img = rgb.copy()
+
+            # Must be BGR for cv2
+            vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
+
+            vis_img = draw_posed_3d_box(
+                self.cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
             )
-            vis = draw_xyz_axis(
-                color,
+            vis_img = draw_xyz_axis(
+                vis_img,
                 ob_in_cam=center_pose,
                 scale=0.1,
                 K=self.cam_K,
@@ -433,22 +424,21 @@ class FoundationPoseROS:
                 is_input_rgb=True,
             )
 
-            # vis = draw_posed_3d_box(self.cam_K, img=color, ob_in_cam=pose, bbox=self.bbox)
-            cv2.imshow("Pose Visualization", vis)
+            cv2.imshow("Pose Visualization", vis_img)
             cv2.waitKey(1)
 
-        # self.frame_count += 1
+        self.frame_count += 1
 
-    def process_color(self, color):
-        rospy.loginfo(f"color.shape = {color.shape}")
-        color = cv2.resize(color, (640, 480), interpolation=cv2.INTER_NEAREST)
-        rospy.loginfo(f"AFTER color.shape = {color.shape}")
-        return color
+    def process_rgb(self, rgb):
+        rospy.logdebug(f"rgb.shape = {rgb.shape}")
+        rgb = cv2.resize(rgb, (640, 480), interpolation=cv2.INTER_NEAREST)
+        rospy.logdebug(f"AFTER rgb.shape = {rgb.shape}")
+        return rgb
 
     def process_depth(self, depth):
-        rospy.loginfo(f"depth.shape = {depth.shape}")
+        rospy.logdebug(f"depth.shape = {depth.shape}")
         depth = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
-        rospy.loginfo(f"AFTER depth.shape = {depth.shape}")
+        rospy.logdebug(f"AFTER depth.shape = {depth.shape}")
         depth = depth / 1000
 
         depth[depth < 0.1] = 0
@@ -457,11 +447,11 @@ class FoundationPoseROS:
         return depth
 
     def process_mask(self, mask):
-        rospy.loginfo(f"mask.shape = {mask.shape}")
+        rospy.logdebug(f"mask.shape = {mask.shape}")
         mask = cv2.resize(mask, (640, 480), interpolation=cv2.INTER_NEAREST).astype(
             bool
         )
-        rospy.loginfo(f"AFTER mask.shape = {mask.shape}")
+        rospy.logdebug(f"AFTER mask.shape = {mask.shape}")
         return mask
 
     def publish_pose(self, pose):
@@ -475,7 +465,7 @@ class FoundationPoseROS:
 
         # Publish the pose
         self.pose_pub.publish(pose_msg)
-        rospy.loginfo("Pose published to /object_pose")
+        rospy.logdebug("Pose published to /object_pose")
 
 
 if __name__ == "__main__":
@@ -486,11 +476,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mesh_file", type=str, default=f"{code_dir}/kiri_meshes/cup_ycbv/textured.obj"
     )
-    parser.add_argument(
-        "--test_scene_dir",
-        type=str,
-        default=f"{code_dir}/demo_data/blueblock/blueblock_occ_slide",
-    )
     parser.add_argument("--est_refine_iter", type=int, default=5)
     parser.add_argument("--track_refine_iter", type=int, default=2)
     parser.add_argument("--debug", type=int, default=3)
@@ -498,4 +483,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     node = FoundationPoseROS(args)
-    rospy.spin()
+    node.run()
