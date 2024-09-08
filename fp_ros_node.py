@@ -15,7 +15,7 @@ import trimesh
 from cv_bridge import CvBridge, CvBridgeError
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image as ROSImage
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import (
@@ -247,6 +247,9 @@ class FoundationPoseROS:
         self.mask_sub = rospy.Subscriber(
             "/sam2_mask", ROSImage, self.mask_callback, queue_size=1
         )
+        self.reset_sub = rospy.Subscriber(
+            "/reset", Bool, self.reset_callback, queue_size=1
+        )
 
         # Publisher for the object pose
         self.pose_pub = rospy.Publisher("/object_pose", ROSImage, queue_size=10)
@@ -259,7 +262,6 @@ class FoundationPoseROS:
 
     def rgb_callback(self, data):
         try:
-            # self.latest_rgb = self.bridge.imgmsg_to_cv2(data, "bgr8")
             self.latest_rgb = self.bridge.imgmsg_to_cv2(data, "rgb8")
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert RGB image: {e}")
@@ -267,7 +269,6 @@ class FoundationPoseROS:
     def depth_callback(self, data):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(data, "64FC1")
-            # self.latest_depth = self.bridge.imgmsg_to_cv2(data, "8UC1")
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert depth image: {e}")
 
@@ -277,11 +278,18 @@ class FoundationPoseROS:
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert mask image: {e}")
 
+    def reset_callback(self, data):
+        if data.data:
+            rospy.loginfo("Resetting the node")
+            self.frame_count = 0
+        else:
+            rospy.loginfo("Received a reset message with data=False")
+
     def run(self):
         ##############################
         # Wait for the first images
         ##############################
-        while (
+        while not rospy.is_shutdown() and (
             self.latest_rgb is None
             or self.latest_depth is None
             or self.latest_mask is None
@@ -295,148 +303,148 @@ class FoundationPoseROS:
         assert self.latest_depth is not None
         assert self.latest_mask is not None
 
-        ##############################
-        # Run first time
-        ##############################
-        rospy.loginfo("Running the first frame")
-
-        first_rgb = self.process_rgb(self.latest_rgb)
-        first_depth = self.process_depth(self.latest_depth)
-        first_mask = self.process_mask(self.latest_mask)
-
-        # Estimation and tracking
-        if self.frame_count == 0:  # Slow 1Hz mask generation + estimation
-            t0 = time.time()
-            pose = self.FPModel.register(
-                K=self.cam_K,
-                rgb=first_rgb,
-                depth=first_depth,
-                ob_mask=first_mask,
-                iteration=self.est_refine_iter,
-            )
-            rospy.loginfo(f"time for reg mask is = {(time.time() - t0)*1000} ms")
-            logging.info("First frame estimation done")
-            assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
-
-            if self.debug >= 3:
-                m = self.object_mesh.copy()
-                m.apply_transform(pose)
-                m.export(f"{self.debug_dir}/model_tf.obj")
-                xyz_map = depth2xyzmap(first_depth, self.cam_K)
-                valid = first_depth >= 0.001
-                pcd = toOpen3dCloud(xyz_map[valid], first_rgb[valid])
-                pcd_path = f"{self.debug_dir}/scene_complete.ply"
-                o3d.io.write_point_cloud(pcd_path, pcd)
-                rospy.loginfo(f"Point cloud saved to {pcd_path}")
-
-        ##############################
-        # Track
-        ##############################
         while not rospy.is_shutdown():
-            start_time = rospy.Time.now()
-
-            logging.info(f"Processing frame: {self.frame_count}")
-            rgb = self.process_rgb(self.latest_rgb)
-            depth = self.process_depth(self.latest_depth)
-            mask = self.process_mask(self.latest_mask)
-
-            t0 = time.time()
-            pose = self.FPModel.track_one(
-                rgb=rgb, depth=depth, K=self.cam_K, iteration=self.track_refine_iter
-            )
-            rospy.loginfo(f"time for track is = {(time.time() - t0)*1000} ms")
-
-            # t0 = time.time()
-            # predicted_depth, predicted_mask = render_depth_and_mask_cache(
-            #     self.object_mesh, pose, self.cam_K, image_width=640, image_height=480
-            # )
-            # rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
-            # iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
-
-            # is_match = True  # HACK
-            # rospy.logerr("=" * 100)
-            # rospy.logerr(f"IoU: {iou}")
-            # if is_match:
-            #     rospy.logerr("Masks match within the threshold.")
-            # else:
-            #     rospy.logerr("Masks do not match within the threshold.")
-
-            #     # pose = self.FPModel.register(K=self.cam_K, rgb=rgb, depth=depth, ob_mask=mask, iteration=self.est_refine_iter)
-            #     pose = self.FPModel.register(
-            #         K=self.cam_K,
-            #         rgb=rgb,
-            #         depth=depth,
-            #         ob_mask=self.process_mask(self.latest_mask),
-            #         iteration=self.est_refine_iter,
-            #     )
-
-            #     logging.info("First frame estimation done")
-
-            #     t0 = time.time()
-            #     predicted_depth, predicted_mask = render_depth_and_mask_cache(
-            #         self.object_mesh,
-            #         pose,
-            #         self.cam_K,
-            #         image_width=640,
-            #         image_height=480,
-            #     )
-            #     rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
-
-            #     if self.debug >= 3:
-            #         m = self.object_mesh.copy()
-            #         m.apply_transform(pose)
-            #         m.export(f"{self.debug_dir}/model_tf.obj")
-            #         xyz_map = depth2xyzmap(depth, self.cam_K)
-            #         valid = depth >= 0.001
-            #         pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
-            #         o3d.io.write_point_cloud(
-            #             f"{self.debug_dir}/scene_complete.ply", pcd
-            #         )
-
-            # rospy.logerr("=" * 100)
-
-            # # Convert OpenCV image (mask) to ROS Image message
-            # mask_msg = self.bridge.cv2_to_imgmsg(
-            #     predicted_mask.astype(np.uint8) * 255, encoding="8UC1"
-            # )
-            # mask_msg.header = Header(stamp=rospy.Time.now())
-
-            # # Publish the mask to the /sam2_mask topic
-            # self.predicted_mask_pub.publish(mask_msg)
-            rospy.loginfo("Predicted mask published to /fp_mask")
-
-            # Publish pose
-            self.publish_pose(pose)
-
-            if self.debug >= 1:
-                center_pose = pose @ np.linalg.inv(self.to_origin)
-                vis_img = rgb.copy()
-
-                # Must be BGR for cv2
-                vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
-
-                vis_img = draw_posed_3d_box(
-                    self.cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
-                )
-                vis_img = draw_xyz_axis(
-                    vis_img,
-                    ob_in_cam=center_pose,
-                    scale=0.1,
-                    K=self.cam_K,
-                    thickness=3,
-                    transparency=0,
-                    is_input_rgb=True,
-                )
-
-                cv2.imshow("Pose Visualization", vis_img)
-                cv2.waitKey(1)
-
+            first_time = self.frame_count == 0
             self.frame_count += 1
 
-            done_time = rospy.Time.now()
-            rospy.loginfo(
-                f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec()*1000)} ms)"
-            )
+            if first_time:
+                ##############################
+                # Run first time
+                ##############################
+                rospy.loginfo("Running the first frame")
+
+                first_rgb = self.process_rgb(self.latest_rgb)
+                first_depth = self.process_depth(self.latest_depth)
+                first_mask = self.process_mask(self.latest_mask)
+
+                # Estimation and tracking
+                t0 = time.time()
+                pose = self.FPModel.register(
+                    K=self.cam_K,
+                    rgb=first_rgb,
+                    depth=first_depth,
+                    ob_mask=first_mask,
+                    iteration=self.est_refine_iter,
+                )
+                rospy.loginfo(f"time for reg mask is = {(time.time() - t0)*1000} ms")
+                logging.info("First frame estimation done")
+                assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
+
+                if self.debug >= 3:
+                    m = self.object_mesh.copy()
+                    m.apply_transform(pose)
+                    m.export(f"{self.debug_dir}/model_tf.obj")
+                    xyz_map = depth2xyzmap(first_depth, self.cam_K)
+                    valid = first_depth >= 0.001
+                    pcd = toOpen3dCloud(xyz_map[valid], first_rgb[valid])
+                    pcd_path = f"{self.debug_dir}/scene_complete.ply"
+                    o3d.io.write_point_cloud(pcd_path, pcd)
+                    rospy.loginfo(f"Point cloud saved to {pcd_path}")
+            else:
+                ##############################
+                # Track
+                ##############################
+                start_time = rospy.Time.now()
+
+                logging.info(f"Processing frame: {self.frame_count}")
+                rgb = self.process_rgb(self.latest_rgb)
+                depth = self.process_depth(self.latest_depth)
+
+                t0 = time.time()
+                pose = self.FPModel.track_one(
+                    rgb=rgb, depth=depth, K=self.cam_K, iteration=self.track_refine_iter
+                )
+                rospy.loginfo(f"time for track is = {(time.time() - t0)*1000} ms")
+
+                # t0 = time.time()
+                # predicted_depth, predicted_mask = render_depth_and_mask_cache(
+                #     self.object_mesh, pose, self.cam_K, image_width=640, image_height=480
+                # )
+                # rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
+                # iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
+
+                # is_match = True  # HACK
+                # rospy.logerr("=" * 100)
+                # rospy.logerr(f"IoU: {iou}")
+                # if is_match:
+                #     rospy.logerr("Masks match within the threshold.")
+                # else:
+                #     rospy.logerr("Masks do not match within the threshold.")
+
+                #     # pose = self.FPModel.register(K=self.cam_K, rgb=rgb, depth=depth, ob_mask=mask, iteration=self.est_refine_iter)
+                #     pose = self.FPModel.register(
+                #         K=self.cam_K,
+                #         rgb=rgb,
+                #         depth=depth,
+                #         ob_mask=self.process_mask(self.latest_mask),
+                #         iteration=self.est_refine_iter,
+                #     )
+
+                #     logging.info("First frame estimation done")
+
+                #     t0 = time.time()
+                #     predicted_depth, predicted_mask = render_depth_and_mask_cache(
+                #         self.object_mesh,
+                #         pose,
+                #         self.cam_K,
+                #         image_width=640,
+                #         image_height=480,
+                #     )
+                #     rospy.logerr(f"time for pred mask is = {(time.time() - t0)*1000} ms")
+
+                #     if self.debug >= 3:
+                #         m = self.object_mesh.copy()
+                #         m.apply_transform(pose)
+                #         m.export(f"{self.debug_dir}/model_tf.obj")
+                #         xyz_map = depth2xyzmap(depth, self.cam_K)
+                #         valid = depth >= 0.001
+                #         pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
+                #         o3d.io.write_point_cloud(
+                #             f"{self.debug_dir}/scene_complete.ply", pcd
+                #         )
+
+                # rospy.logerr("=" * 100)
+
+                # # Convert OpenCV image (mask) to ROS Image message
+                # mask_msg = self.bridge.cv2_to_imgmsg(
+                #     predicted_mask.astype(np.uint8) * 255, encoding="8UC1"
+                # )
+                # mask_msg.header = Header(stamp=rospy.Time.now())
+
+                # # Publish the mask to the /sam2_mask topic
+                # self.predicted_mask_pub.publish(mask_msg)
+                rospy.loginfo("Predicted mask published to /fp_mask")
+
+                # Publish pose
+                self.publish_pose(pose)
+
+                if self.debug >= 1:
+                    center_pose = pose @ np.linalg.inv(self.to_origin)
+                    vis_img = rgb.copy()
+
+                    # Must be BGR for cv2
+                    vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
+
+                    vis_img = draw_posed_3d_box(
+                        self.cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
+                    )
+                    vis_img = draw_xyz_axis(
+                        vis_img,
+                        ob_in_cam=center_pose,
+                        scale=0.1,
+                        K=self.cam_K,
+                        thickness=3,
+                        transparency=0,
+                        is_input_rgb=True,
+                    )
+
+                    cv2.imshow("Pose Visualization", vis_img)
+                    cv2.waitKey(1)
+
+                done_time = rospy.Time.now()
+                rospy.loginfo(
+                    f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec()*1000)} ms)"
+                )
 
     def process_rgb(self, rgb):
         rospy.logdebug(f"rgb.shape = {rgb.shape}")
