@@ -7,8 +7,6 @@ import time
 
 import cv2
 import numpy as np
-import nvdiffrast.torch as dr
-import open3d as o3d
 import pyrender
 import rospy
 import trimesh
@@ -18,14 +16,9 @@ from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Bool, Header
 
-from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import (
-    depth2xyzmap,
     draw_posed_3d_box,
     draw_xyz_axis,
-    set_logging_format,
-    set_seed,
-    toOpen3dCloud,
 )
 
 
@@ -236,8 +229,17 @@ class FoundationPoseROS:
         self.reset_pub = rospy.Publisher("/reset", Bool, queue_size=1)
         self.predicted_mask_pub = rospy.Publisher("/fp_mask", ROSImage, queue_size=1)
 
-        RATE_HZ = 1
+        RATE_HZ = 10
         self.rate = rospy.Rate(RATE_HZ)
+
+        # State
+        self.RESET_COOLDOWN_TIME_SEC = 15
+        self.last_reset_time = rospy.Time.now() - rospy.Duration(
+            self.RESET_COOLDOWN_TIME_SEC
+        )
+        self.INVALID_THRESHOLD_SEC = 1.0
+        self.invalid_counter_threshold = int(self.INVALID_THRESHOLD_SEC * RATE_HZ)
+        self.invalid_counter = 0
 
     def rgb_callback(self, data):
         try:
@@ -260,7 +262,12 @@ class FoundationPoseROS:
     def pose_callback(self, data: Pose):
         xyz = np.array([data.position.x, data.position.y, data.position.z])
         quat_xyzw = np.array(
-            [data.orientation.x, data.orientation.y, data.orientation.z, data.orientation.w]
+            [
+                data.orientation.x,
+                data.orientation.y,
+                data.orientation.z,
+                data.orientation.w,
+            ]
         )
         latest_pose = np.eye(4)
         latest_pose[:3, 3] = xyz
@@ -308,11 +315,36 @@ class FoundationPoseROS:
 
             rospy.loginfo("=" * 100)
             rospy.loginfo(f"IoU: {iou}")
+            """
+            Send the reset signal only under certain conditions to avoid false positives
+            1. Do not send a reset signal if it sent one in the last RESET_COOLDOWN_TIME_SEC seconds
+            2. Only send a reset signal if the masks do not match for more than INVALID_THRESHOLD_SEC seconds
+            """
             if is_match:
                 rospy.loginfo("Masks match within the threshold.")
+                self.invalid_counter = 0
             else:
                 rospy.loginfo("Masks do not match within the threshold.")
-                self.reset_pub.publish(Bool(data=True))
+                if rospy.Time.now() - self.last_reset_time < rospy.Duration(
+                    self.RESET_COOLDOWN_TIME_SEC
+                ):
+                    rospy.loginfo(
+                        f"Waiting for the reset cooldown period of {self.RESET_COOLDOWN_TIME_SEC} seconds to end. Been {rospy.Time.now() - self.last_reset_time} seconds"
+                    )
+                    self.invalid_counter = 0
+                else:
+                    self.invalid_counter += 1
+
+                rospy.loginfo(f"Invalid counter: {self.invalid_counter}")
+                if self.invalid_counter >= self.invalid_counter_threshold:
+                    rospy.loginfo("Resetting the scene.")
+                    self.reset_pub.publish(Bool(data=True))
+                    self.invalid_counter = 0
+                    self.last_reset_time = rospy.Time.now()
+                else:
+                    rospy.loginfo(
+                        f"Waiting for {self.INVALID_THRESHOLD_SEC} consecutive seconds ({self.invalid_counter_threshold} frames) of mismatch to reset the scene."
+                    )
 
             # Convert OpenCV image (mask) to ROS Image message
             mask_msg = self.bridge.cv2_to_imgmsg(
