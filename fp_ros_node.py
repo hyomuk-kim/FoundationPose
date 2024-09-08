@@ -37,7 +37,7 @@ class FoundationPoseROS:
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_mask = None
-        self.frame_count = 0
+        self.is_object_registered = False
 
         self.est_refine_iter = args.est_refine_iter
         self.track_refine_iter = args.track_refine_iter
@@ -118,7 +118,7 @@ class FoundationPoseROS:
     def reset_callback(self, data):
         if data.data:
             rospy.loginfo("Resetting the node")
-            self.frame_count = 0
+            self.is_object_registered = False
         else:
             rospy.loginfo("Received a reset message with data=False")
 
@@ -141,10 +141,7 @@ class FoundationPoseROS:
         assert self.latest_mask is not None
 
         while not rospy.is_shutdown():
-            first_time = self.frame_count == 0
-            self.frame_count += 1
-
-            if first_time:
+            if not self.is_object_registered:
                 ##############################
                 # Run first time
                 ##############################
@@ -177,13 +174,14 @@ class FoundationPoseROS:
                     pcd_path = f"{self.debug_dir}/scene_complete.ply"
                     o3d.io.write_point_cloud(pcd_path, pcd)
                     rospy.loginfo(f"Point cloud saved to {pcd_path}")
+
+                self.is_object_registered = True
             else:
                 ##############################
                 # Track
                 ##############################
                 start_time = rospy.Time.now()
 
-                logging.info(f"Processing frame: {self.frame_count}")
                 rgb = self.process_rgb(self.latest_rgb)
                 depth = self.process_depth(self.latest_depth)
                 _mask = self.process_mask(self.latest_mask)
