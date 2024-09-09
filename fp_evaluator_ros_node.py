@@ -233,7 +233,7 @@ class FoundationPoseROS:
         self.rate = rospy.Rate(RATE_HZ)
 
         # State
-        self.RESET_COOLDOWN_TIME_SEC = 3
+        self.RESET_COOLDOWN_TIME_SEC = 1.0
         self.last_reset_time = rospy.Time.now() - rospy.Duration(
             self.RESET_COOLDOWN_TIME_SEC
         )
