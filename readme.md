@@ -3,6 +3,18 @@
 
 # TYLER DOCUMENTATION (September 8, 2024)
 
+## EXAMPLE VIDEO
+
+This is a live example that uses 4 components:
+
+1. RealSense camera: `roslaunch realsense2_camera rs_camera.launch align_depth:=true`
+2. Real-Time SAM2 with smart prompting: https://github.com/tylerlum/segment-anything-2-real-time
+3. FoundationPose pose tracking: https://github.com/tylerlum/FoundationPose/
+4. FoundationPose evaluation for resetting the tracker: https://github.com/tylerlum/FoundationPose/
+
+[2024-09-08_SAM2_FP_Robust_compressed.webm](https://github.com/user-attachments/assets/892a984a-571d-4451-bf69-15415800981c)
+
+
 ## CHANGES
 
 * Addition of `docker/ros_dockerfile` and `docker/run_ros_container.sh` to add ROS Noetic installation with Robostack (https://robostack.github.io/GettingStarted.html)
