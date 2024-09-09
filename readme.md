@@ -1,6 +1,105 @@
 # FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects
 [[Paper]](https://arxiv.org/abs/2312.08344) [[Website]](https://nvlabs.github.io/FoundationPose/)
 
+# TYLER DOCUMENTATION (September 8, 2024)
+
+## CHANGES
+
+* Addition of `docker/ros_dockerfile` and `docker/run_ros_container.sh` to add ROS Noetic installation with Robostack (https://robostack.github.io/GettingStarted.html)
+
+* Addition of `fp_ros_node.py`, which listens for RGB images, depth images, and mask images, then publishes poses (make sure to set the input mesh and camera intrinsics)
+
+* Addition of `fp_evaluator_ros_node.py`, which listens for RGB images, depth images, mask images, and poses, then publishes predicted masks and a reset message if predicted mask is poor (make sure to set the input mesh and camera intrinsics)
+
+Note that we keep the `fp_ros_node.py` as simple as possible because we need FoundationPose to run at as high a rate as possible (20-50Hz). If it runs slower than that, it will do very poorly because the tracking method only works well with small pose changes. This is achievable when running at a high rate, but severely degrades if running at a low rate (~5Hz). This is why we make a separate `fp_ros_node.py` for debugging and evaluation (to decide if it needs to reset the pose tracker). Also be careful about other things running on the GPU (e.g. mask generator).
+
+## HOW TO RUN
+
+### Docker
+
+We needed to use Docker. Using conda alone did not work, despite lots of effort.
+
+```
+# May need to add sudo to all docker commands (if not set up for your user)
+cd docker/
+docker build --network host -t ros_foundationpose .
+bash docker/run_ros_container.sh
+```
+
+If it's the first time you launch the container, you need to build extensions.
+```
+bash build_all.sh
+```
+
+Later you can execute into the container without re-build.
+```
+docker exec -it ros_foundationpose bash
+```
+
+If you close the container, open again with
+```
+bash docker/run_ros_container.sh
+```
+
+### Test If It Works
+
+```
+docker exec -it ros_foundationpose bash
+python run_demo.py
+```
+
+If you get this error:
+```
+ImportError: /usr/lib/x86_64-linux-gnu/libstdc++.so.6: version GLIBCXX_3.4.29' not found (required by /opt/conda/envs/my/lib/python3.9/site-packages/matplotlib/_c_internal_utils.cpython-39-x86_64-linux-gnu.so)
+```
+
+Fix like so:
+```
+echo $CONDA_PREFIX
+/opt/conda/envs/my
+
+find $CONDA_PREFIX -name "*libstdc++.so*"
+/opt/conda/envs/my/lib/libstdc++.so
+/opt/conda/envs/my/lib/libstdc++.so.6
+/opt/conda/envs/my/lib/libstdc++.so.6.0.33
+
+export LD_LIBRARY_PATH=/opt/conda/envs/my/lib:$LD_LIBRARY_PATH  # Replace if yours is different
+```
+
+### Run ROS
+In a terminal:
+```
+docker exec -it ros_foundationpose bash
+
+# Set ROS variables if running across PCs
+export ROS_MASTER_URI=http://bohg-franka.stanford.edu:11311  # Master machine
+export ROS_HOSTNAME=bohg-ws-19.stanford.edu  # This machine
+
+python fp_ros_node.py
+```
+
+In a terminal:
+```
+docker exec -it ros_foundationpose bash
+
+# Set ROS variables if running across PCs
+export ROS_MASTER_URI=http://bohg-franka.stanford.edu:11311  # Master machine
+export ROS_HOSTNAME=bohg-ws-19.stanford.edu  # This machine
+
+python fp_evaluator_ros_node.py
+```
+
+If things are not working, make sure that you can do things like:
+```
+roscore  # ROS works
+```
+
+```
+rostopic list  # See expected topics
+```
+
+# ORIGINAL DOCUMENTATION
+
 This is the official implementation of our paper to be appeared in CVPR 2024 (Highlight)
 
 Contributors: Bowen Wen, Wei Yang, Jan Kautz, Stan Birchfield
