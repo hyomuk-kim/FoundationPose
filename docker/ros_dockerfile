@@ -1,0 +1,10 @@
+FROM foundationpose
+
+RUN \
+  conda activate my \
+  && conda config --env --add channels conda-forge \
+  && conda config --env --add channels robostack-staging \
+  && conda config --env --remove channels defaults \
+  && conda install ros-noetic-desktop -y \
+  && conda deactivate \
+  && conda activate my
