@@ -15,7 +15,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image as ROSImage
-from std_msgs.msg import Bool
+from std_msgs.msg import Int32
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import (
@@ -91,7 +91,7 @@ class FoundationPoseROS:
             "/sam2_mask", ROSImage, self.mask_callback, queue_size=1
         )
         self.reset_sub = rospy.Subscriber(
-            "/reset", Bool, self.reset_callback, queue_size=1
+            "/reset", Int32, self.reset_callback, queue_size=1
         )
 
         # Publisher for the object pose
@@ -116,11 +116,11 @@ class FoundationPoseROS:
             rospy.logerr(f"Could not convert mask image: {e}")
 
     def reset_callback(self, data):
-        if data.data:
+        if data.data > 0:
             rospy.loginfo("Resetting the node")
             self.is_object_registered = False
         else:
-            rospy.loginfo("Received a reset message with data=False")
+            rospy.loginfo("Received a reset message with data <= 0")
 
     def run(self):
         ##############################
@@ -274,10 +274,13 @@ class FoundationPoseROS:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     code_dir = os.path.dirname(os.path.realpath(__file__))
-    # parser.add_argument('--mesh_file', type=str, default=f'{code_dir}/kiri_meshes/snackbox/3DModel.obj')
-    # parser.add_argument('--mesh_file', type=str, default=f'{code_dir}/kiri_meshes/blueblock/3DModel.obj')
+
+    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/snackbox/3DModel.obj"
+    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/blueblock/3DModel.obj"
+    DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/cup_ycbv/textured.obj"
+
     parser.add_argument(
-        "--mesh_file", type=str, default=f"{code_dir}/kiri_meshes/cup_ycbv/textured.obj"
+        "--mesh_file", type=str, default=DEFAULT_MESH_FILE,
     )
     parser.add_argument("--est_refine_iter", type=int, default=1)
     parser.add_argument("--track_refine_iter", type=int, default=2)

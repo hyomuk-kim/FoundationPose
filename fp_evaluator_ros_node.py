@@ -14,7 +14,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image as ROSImage
-from std_msgs.msg import Bool, Header
+from std_msgs.msg import Int32, Header
 
 from Utils import (
     draw_posed_3d_box,
@@ -179,7 +179,7 @@ def render_depth_and_mask_cache(
         return depth_image, mask
 
 
-class FoundationPoseROS:
+class FoundationPoseEvaluatorROS:
     def __init__(self, args):
         # Variables for storing the latest images
         self.latest_rgb = None
@@ -226,7 +226,7 @@ class FoundationPoseROS:
         )
 
         # Publisher for the object pose
-        self.reset_pub = rospy.Publisher("/reset", Bool, queue_size=1)
+        self.reset_pub = rospy.Publisher("/reset", Int32, queue_size=1)
         self.predicted_mask_pub = rospy.Publisher("/fp_mask", ROSImage, queue_size=1)
 
         RATE_HZ = 10
@@ -320,6 +320,7 @@ class FoundationPoseROS:
             1. Do not send a reset signal if it sent one in the last RESET_COOLDOWN_TIME_SEC seconds
             2. Only send a reset signal if the masks do not match for more than INVALID_THRESHOLD_SEC seconds
             """
+            reset_msg = Int32(data=0)
             if is_match:
                 rospy.loginfo("Masks match within the threshold.")
                 self.invalid_counter = 0
@@ -338,13 +339,14 @@ class FoundationPoseROS:
                 rospy.loginfo(f"Invalid counter: {self.invalid_counter}")
                 if self.invalid_counter >= self.invalid_counter_threshold:
                     rospy.loginfo("Resetting the scene.")
-                    self.reset_pub.publish(Bool(data=True))
+                    reset_msg.data = 1
                     self.invalid_counter = 0
                     self.last_reset_time = rospy.Time.now()
                 else:
                     rospy.loginfo(
                         f"Waiting for {self.INVALID_THRESHOLD_SEC} consecutive seconds ({self.invalid_counter_threshold} frames) of mismatch to reset the scene."
                     )
+            self.reset_pub.publish(reset_msg)
 
             # Convert OpenCV image (mask) to ROS Image message
             mask_msg = self.bridge.cv2_to_imgmsg(
@@ -421,14 +423,17 @@ class FoundationPoseROS:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     code_dir = os.path.dirname(os.path.realpath(__file__))
-    # parser.add_argument('--mesh_file', type=str, default=f'{code_dir}/kiri_meshes/snackbox/3DModel.obj')
-    # parser.add_argument('--mesh_file', type=str, default=f'{code_dir}/kiri_meshes/blueblock/3DModel.obj')
+
+    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/snackbox/3DModel.obj"
+    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/blueblock/3DModel.obj"
+    DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/cup_ycbv/textured.obj"
+
     parser.add_argument(
-        "--mesh_file", type=str, default=f"{code_dir}/kiri_meshes/cup_ycbv/textured.obj"
+        "--mesh_file", type=str, default=DEFAULT_MESH_FILE,
     )
     parser.add_argument("--debug", type=int, default=3)
     parser.add_argument("--debug_dir", type=str, default=f"{code_dir}/debug")
     args = parser.parse_args()
 
-    node = FoundationPoseROS(args)
+    node = FoundationPoseEvaluatorROS(args)
     node.run()
