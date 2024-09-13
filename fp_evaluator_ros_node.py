@@ -20,6 +20,7 @@ from Utils import (
     draw_posed_3d_box,
     draw_xyz_axis,
 )
+from fp_ros_utils import get_mesh_file, get_cam_K
 
 
 def compare_masks(mask1, mask2, threshold=0.2):
@@ -180,7 +181,7 @@ def render_depth_and_mask_cache(
 
 
 class FoundationPoseEvaluatorROS:
-    def __init__(self, args):
+    def __init__(self):
         # Variables for storing the latest images
         self.latest_rgb = None
         self.latest_depth = None
@@ -188,25 +189,18 @@ class FoundationPoseEvaluatorROS:
         self.latest_pose = None
         self.frame_count = 0
 
-        self.debug = args.debug
-        self.debug_dir = args.debug_dir
-        os.makedirs(self.debug_dir, exist_ok=True)
-        os.makedirs(f"{self.debug_dir}/track_vis", exist_ok=True)
-        os.makedirs(f"{self.debug_dir}/ob_in_cam", exist_ok=True)
-
-        rospy.init_node("fp_evaulator_node")
+        rospy.init_node("fp_evaluator_node")
         self.bridge = CvBridge()
 
         # Load object mesh
-        self.object_mesh = trimesh.load(args.mesh_file)
+        mesh_file = get_mesh_file()
+
+        self.object_mesh = trimesh.load(mesh_file)
         self.to_origin, extents = trimesh.bounds.oriented_bounds(self.object_mesh)
         self.bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
         # Camera parameters
-        code_dir = os.path.dirname(os.path.realpath(__file__))
-        cam_K_file = f"{code_dir}/demo_data/blueblock/blueblock_occ_slide/cam_K.txt"
-        rospy.loginfo(f"cam_K_file = {cam_K_file}")
-        self.cam_K = np.loadtxt(cam_K_file).reshape(3, 3)
+        self.cam_K = get_cam_K()
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
@@ -358,7 +352,8 @@ class FoundationPoseEvaluatorROS:
             self.predicted_mask_pub.publish(mask_msg)
             rospy.loginfo("Predicted mask published to /fp_mask")
 
-            if self.debug >= 1:
+            VISUALIZE = True
+            if VISUALIZE:
                 center_pose = pose @ np.linalg.inv(self.to_origin)
 
                 # Must be BGR for cv2
@@ -421,19 +416,5 @@ class FoundationPoseEvaluatorROS:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    code_dir = os.path.dirname(os.path.realpath(__file__))
-
-    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/snackbox/3DModel.obj"
-    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/blueblock/3DModel.obj"
-    DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/cup_ycbv/textured.obj"
-
-    parser.add_argument(
-        "--mesh_file", type=str, default=DEFAULT_MESH_FILE,
-    )
-    parser.add_argument("--debug", type=int, default=3)
-    parser.add_argument("--debug_dir", type=str, default=f"{code_dir}/debug")
-    args = parser.parse_args()
-
-    node = FoundationPoseEvaluatorROS(args)
+    node = FoundationPoseEvaluatorROS()
     node.run()

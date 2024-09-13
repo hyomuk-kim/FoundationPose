@@ -29,7 +29,7 @@ from Utils import (
 
 
 class FoundationPoseROS:
-    def __init__(self, args):
+    def __init__(self):
         set_logging_format()
         set_seed(0)
 
@@ -39,10 +39,13 @@ class FoundationPoseROS:
         self.latest_mask = None
         self.is_object_registered = False
 
-        self.est_refine_iter = args.est_refine_iter
-        self.track_refine_iter = args.track_refine_iter
-        self.debug = args.debug
-        self.debug_dir = args.debug_dir
+        self.est_refine_iter = 1  # Want this as low as possible to run as fast as possible (roughly 1 second for each iter?)
+        self.track_refine_iter = 2   # Want this as low as possible to run as fast as possible (1 seems to be too low though)
+
+        # Debugging
+        code_dir = os.path.dirname(os.path.realpath(__file__))
+        self.debug = 0  # Keep debug level at 0 to avoid unnecessary overhead since we want this running as fast as possible
+        self.debug_dir = f"{code_dir}/debug"
         os.makedirs(self.debug_dir, exist_ok=True)
         os.makedirs(f"{self.debug_dir}/track_vis", exist_ok=True)
         os.makedirs(f"{self.debug_dir}/ob_in_cam", exist_ok=True)
@@ -72,10 +75,7 @@ class FoundationPoseROS:
         logging.info("Estimator initialization done")
 
         # Camera parameters
-        code_dir = os.path.dirname(os.path.realpath(__file__))
-        cam_K_file = f"{code_dir}/demo_data/blueblock/blueblock_occ_slide/cam_K.txt"
-        rospy.loginfo(f"cam_K_file = {cam_K_file}")
-        self.cam_K = np.loadtxt(cam_K_file).reshape(3, 3)
+        self.cam_K = get_cam_K()
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
@@ -272,21 +272,5 @@ class FoundationPoseROS:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    code_dir = os.path.dirname(os.path.realpath(__file__))
-
-    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/snackbox/3DModel.obj"
-    # DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/blueblock/3DModel.obj"
-    DEFAULT_MESH_FILE = f"{code_dir}/kiri_meshes/cup_ycbv/textured.obj"
-
-    parser.add_argument(
-        "--mesh_file", type=str, default=DEFAULT_MESH_FILE,
-    )
-    parser.add_argument("--est_refine_iter", type=int, default=1)
-    parser.add_argument("--track_refine_iter", type=int, default=2)
-    parser.add_argument("--debug", type=int, default=0)
-    parser.add_argument("--debug_dir", type=str, default=f"{code_dir}/debug")
-    args = parser.parse_args()
-
-    node = FoundationPoseROS(args)
+    node = FoundationPoseROS()
     node.run()
