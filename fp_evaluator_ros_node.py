@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 
-import argparse
 import logging
-import os
 import time
 
 import cv2
@@ -14,13 +12,13 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image as ROSImage
-from std_msgs.msg import Int32, Header
+from std_msgs.msg import Header, Int32
 
+from fp_ros_utils import get_cam_K, get_mesh_file
 from Utils import (
     draw_posed_3d_box,
     draw_xyz_axis,
 )
-from fp_ros_utils import get_mesh_file, get_cam_K
 
 
 def compare_masks(mask1, mask2, threshold=0.2):

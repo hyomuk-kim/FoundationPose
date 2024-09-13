@@ -1,6 +1,7 @@
-import rospy
-import numpy as np
 import os
+
+import numpy as np
+import rospy
 
 
 def get_mesh_file() -> str:

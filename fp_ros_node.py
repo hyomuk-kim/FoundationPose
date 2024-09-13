@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import argparse
 import logging
 import os
 import time
@@ -18,6 +17,7 @@ from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Int32
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
+from fp_ros_utils import get_cam_K, get_mesh_file
 from Utils import (
     depth2xyzmap,
     draw_posed_3d_box,
@@ -40,7 +40,7 @@ class FoundationPoseROS:
         self.is_object_registered = False
 
         self.est_refine_iter = 1  # Want this as low as possible to run as fast as possible (roughly 1 second for each iter?)
-        self.track_refine_iter = 2   # Want this as low as possible to run as fast as possible (1 seems to be too low though)
+        self.track_refine_iter = 2  # Want this as low as possible to run as fast as possible (1 seems to be too low though)
 
         # Debugging
         code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -54,7 +54,8 @@ class FoundationPoseROS:
         self.bridge = CvBridge()
 
         # Load object mesh
-        self.object_mesh = trimesh.load(args.mesh_file)
+        mesh_file = get_mesh_file()
+        self.object_mesh = trimesh.load(mesh_file)
         self.to_origin, extents = trimesh.bounds.oriented_bounds(self.object_mesh)
         self.bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
