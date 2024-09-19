@@ -80,7 +80,7 @@ class FoundationPoseROS:
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
-            # "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
+            # "/camera/color/image_raw",
             "/zed/zed_node/rgb/image_rect_color",
             ROSImage,
             self.rgb_callback,
@@ -114,9 +114,7 @@ class FoundationPoseROS:
     def depth_callback(self, data):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(data, "64FC1")
-            rospy.loginfo(
-                f"Received depth image: {self.latest_depth.shape}, min = {np.min(self.latest_depth)}, max = {np.max(self.latest_depth)}, mean = {np.mean(self.latest_depth)}, median = {np.median(self.latest_depth)}, values = {np.unique(self.latest_depth)}"
-            )
+            rospy.loginfo(f"Received depth image: {self.latest_depth.shape}")
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert depth image: {e}")
 

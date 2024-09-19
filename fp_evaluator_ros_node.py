@@ -202,7 +202,7 @@ class FoundationPoseEvaluatorROS:
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
-            # "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
+            # "/camera/color/image_raw",
             "/zed/zed_node/rgb/image_rect_color",
             ROSImage,
             self.rgb_callback,
@@ -304,9 +304,14 @@ class FoundationPoseEvaluatorROS:
             mask = self.process_mask(self.latest_mask)
             pose = self.latest_pose.copy()
 
+            height, width = mask.shape[:2]
             t0 = time.time()
             predicted_depth, predicted_mask = render_depth_and_mask_cache(
-                self.object_mesh, pose, self.cam_K, image_width=640, image_height=360
+                self.object_mesh,
+                pose,
+                self.cam_K,
+                image_width=width,
+                image_height=height,
             )
             rospy.loginfo(f"time for pred mask is = {(time.time() - t0)*1000} ms")
             iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
