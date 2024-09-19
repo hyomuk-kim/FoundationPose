@@ -43,7 +43,7 @@ def compare_masks(mask1, mask2, threshold=0.2):
 # Path to the mesh file
 
 
-def render_depth_and_mask(trimesh_obj, T_C_O, K, image_width=640, image_height=480):
+def render_depth_and_mask(trimesh_obj, T_C_O, K, image_width=640, image_height=360):
     """
     Render a depth image and mask image given a trimesh object and an object pose.
 
@@ -52,7 +52,7 @@ def render_depth_and_mask(trimesh_obj, T_C_O, K, image_width=640, image_height=4
         T_C_O: 4x4 numpy array representing the object pose relative to the camera.
         K: 3x3 numpy array representing the camera intrinsic matrix.
         image_width: Width of the rendered image (default: 640).
-        image_height: Height of the rendered image (default: 480).
+        image_height: Height of the rendered image (default: 360).
 
     Returns:
         depth_image: 2D numpy array representing the depth image.
@@ -92,7 +92,7 @@ def render_depth_and_mask(trimesh_obj, T_C_O, K, image_width=640, image_height=4
 
 
 def render_depth_and_mask_cache(
-    trimesh_obj, T_C_O, K, image_width=640, image_height=480
+    trimesh_obj, T_C_O, K, image_width=640, image_height=360
 ):
     """
     Render a depth image and mask image given a trimesh object and an object pose.
@@ -102,7 +102,7 @@ def render_depth_and_mask_cache(
         T_C_O: 4x4 numpy array representing the object pose relative to the camera.
         K: 3x3 numpy array representing the camera intrinsic matrix.
         image_width: Width of the rendered image (default: 640).
-        image_height: Height of the rendered image (default: 480).
+        image_height: Height of the rendered image (default: 360).
 
     Returns:
         depth_image: 2D numpy array representing the depth image.
@@ -202,10 +202,12 @@ class FoundationPoseEvaluatorROS:
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
-            "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
+            # "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
+            "/zed/zed_node/rgb/image_rect_color", ROSImage, self.rgb_callback, queue_size=1
         )
         self.depth_sub = rospy.Subscriber(
-            "/camera/aligned_depth_to_color/image_raw",
+            # "/camera/aligned_depth_to_color/image_raw",
+            "/zed/zed_node/depth/depth_registered",
             ROSImage,
             self.depth_callback,
             queue_size=1,
@@ -225,9 +227,9 @@ class FoundationPoseEvaluatorROS:
         self.rate = rospy.Rate(RATE_HZ)
 
         # State
-        self.RESET_COOLDOWN_TIME_SEC = 1.0
+        self.RESET_COOLDOWN_TIME_SEC = 1
         self.last_reset_time = rospy.Time.now() - rospy.Duration(
-            self.RESET_COOLDOWN_TIME_SEC
+            secs=self.RESET_COOLDOWN_TIME_SEC
         )
         self.INVALID_THRESHOLD_SEC = 1.0
         self.invalid_counter_threshold = int(self.INVALID_THRESHOLD_SEC * RATE_HZ)
@@ -300,7 +302,7 @@ class FoundationPoseEvaluatorROS:
 
             t0 = time.time()
             predicted_depth, predicted_mask = render_depth_and_mask_cache(
-                self.object_mesh, pose, self.cam_K, image_width=640, image_height=480
+                self.object_mesh, pose, self.cam_K, image_width=640, image_height=360
             )
             rospy.loginfo(f"time for pred mask is = {(time.time() - t0)*1000} ms")
             iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
@@ -382,28 +384,31 @@ class FoundationPoseEvaluatorROS:
 
     def process_rgb(self, rgb):
         rospy.logdebug(f"rgb.shape = {rgb.shape}")
-        rgb = cv2.resize(rgb, (640, 480), interpolation=cv2.INTER_NEAREST)
+        rgb = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_NEAREST)
         rospy.logdebug(f"AFTER rgb.shape = {rgb.shape}")
         rospy.logdebug(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
         return rgb
 
     def process_depth(self, depth):
         rospy.logdebug(f"depth.shape = {depth.shape}")
-        depth = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
+        depth = cv2.resize(depth, (640, 360), interpolation=cv2.INTER_NEAREST)
         rospy.logdebug(f"AFTER depth.shape = {depth.shape}")
         rospy.logdebug(
             f"depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
         )
-        depth = depth / 1000
+        # depth = depth / 1000
 
         depth[depth < 0.1] = 0
         depth[depth > 4] = 0
+        # Turn nan values into 0
+        depth[np.isnan(depth)] = 0
+        depth[np.isinf(depth)] = 0
 
         return depth
 
     def process_mask(self, mask):
         rospy.logdebug(f"mask.shape = {mask.shape}")
-        mask = cv2.resize(mask, (640, 480), interpolation=cv2.INTER_NEAREST).astype(
+        mask = cv2.resize(mask, (640, 360), interpolation=cv2.INTER_NEAREST).astype(
             bool
         )
         rospy.logdebug(f"AFTER mask.shape = {mask.shape}")

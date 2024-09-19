@@ -80,10 +80,12 @@ class FoundationPoseROS:
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
-            "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
+            # "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
+            "/zed/zed_node/rgb/image_rect_color", ROSImage, self.rgb_callback, queue_size=1
         )
         self.depth_sub = rospy.Subscriber(
-            "/camera/aligned_depth_to_color/image_raw",
+            # "/camera/aligned_depth_to_color/image_raw",
+            "/zed/zed_node/depth/depth_registered",
             ROSImage,
             self.depth_callback,
             queue_size=1,
@@ -101,12 +103,14 @@ class FoundationPoseROS:
     def rgb_callback(self, data):
         try:
             self.latest_rgb = self.bridge.imgmsg_to_cv2(data, "rgb8")
+            rospy.loginfo(f"Received RGB image: {self.latest_rgb.shape}")
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert RGB image: {e}")
 
     def depth_callback(self, data):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(data, "64FC1")
+            rospy.loginfo(f"Received depth image: {self.latest_depth.shape}, min = {np.min(self.latest_depth)}, max = {np.max(self.latest_depth)}, mean = {np.mean(self.latest_depth)}, median = {np.median(self.latest_depth)}, values = {np.unique(self.latest_depth)}")
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert depth image: {e}")
 
@@ -163,6 +167,7 @@ class FoundationPoseROS:
                 )
                 rospy.loginfo(f"time for reg mask is = {(time.time() - t0)*1000} ms")
                 logging.info("First frame estimation done")
+                rospy.loginfo(f"pose = {pose}")
                 assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
 
                 if self.debug >= 3:
@@ -225,28 +230,35 @@ class FoundationPoseROS:
 
     def process_rgb(self, rgb):
         rospy.logdebug(f"rgb.shape = {rgb.shape}")
-        rgb = cv2.resize(rgb, (640, 480), interpolation=cv2.INTER_NEAREST)
+        rgb = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_NEAREST)
         rospy.logdebug(f"AFTER rgb.shape = {rgb.shape}")
         rospy.logdebug(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
         return rgb
 
     def process_depth(self, depth):
         rospy.logdebug(f"depth.shape = {depth.shape}")
-        depth = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
+        depth = cv2.resize(depth, (640, 360), interpolation=cv2.INTER_NEAREST)
         rospy.logdebug(f"AFTER depth.shape = {depth.shape}")
         rospy.logdebug(
             f"depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
         )
-        depth = depth / 1000
+        # depth = depth / 1000
 
         depth[depth < 0.1] = 0
         depth[depth > 4] = 0
+
+        # Turn nan values into 0
+        depth[np.isnan(depth)] = 0
+        depth[np.isinf(depth)] = 0
+        rospy.logdebug(
+            f"AFTER depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
+        )
 
         return depth
 
     def process_mask(self, mask):
         rospy.logdebug(f"mask.shape = {mask.shape}")
-        mask = cv2.resize(mask, (640, 480), interpolation=cv2.INTER_NEAREST).astype(
+        mask = cv2.resize(mask, (640, 360), interpolation=cv2.INTER_NEAREST).astype(
             bool
         )
         rospy.logdebug(f"AFTER mask.shape = {mask.shape}")
