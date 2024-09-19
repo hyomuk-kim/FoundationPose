@@ -81,7 +81,10 @@ class FoundationPoseROS:
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
             # "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
-            "/zed/zed_node/rgb/image_rect_color", ROSImage, self.rgb_callback, queue_size=1
+            "/zed/zed_node/rgb/image_rect_color",
+            ROSImage,
+            self.rgb_callback,
+            queue_size=1,
         )
         self.depth_sub = rospy.Subscriber(
             # "/camera/aligned_depth_to_color/image_raw",
@@ -111,7 +114,9 @@ class FoundationPoseROS:
     def depth_callback(self, data):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(data, "64FC1")
-            rospy.loginfo(f"Received depth image: {self.latest_depth.shape}, min = {np.min(self.latest_depth)}, max = {np.max(self.latest_depth)}, mean = {np.mean(self.latest_depth)}, median = {np.median(self.latest_depth)}, values = {np.unique(self.latest_depth)}")
+            rospy.loginfo(
+                f"Received depth image: {self.latest_depth.shape}, min = {np.min(self.latest_depth)}, max = {np.max(self.latest_depth)}, mean = {np.mean(self.latest_depth)}, median = {np.median(self.latest_depth)}, values = {np.unique(self.latest_depth)}"
+            )
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert depth image: {e}")
 
@@ -234,20 +239,23 @@ class FoundationPoseROS:
         return rgb
 
     def process_depth(self, depth):
-        rospy.logdebug(
-            f"depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
-        )
-        # depth = depth / 1000
-
-        depth[depth < 0.1] = 0
-        depth[depth > 4] = 0
-
         # Turn nan values into 0
         depth[np.isnan(depth)] = 0
         depth[np.isinf(depth)] = 0
-        rospy.logdebug(
-            f"AFTER depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
-        )
+
+        # depth is either in meters or millimeters
+        # Need to convert to meters
+        # If the max value is greater than 100, then it's likely in mm
+        in_mm = depth.max() > 100
+        if in_mm:
+            rospy.loginfo(f"Converting depth from mm to m since max = {depth.max()}")
+            depth = depth / 1000
+        else:
+            rospy.loginfo(f"Depth is in meters since max = {depth.max()}")
+
+        # Clamp
+        depth[depth < 0.1] = 0
+        depth[depth > 4] = 0
 
         return depth
 
