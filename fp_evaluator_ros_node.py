@@ -203,11 +203,15 @@ class FoundationPoseEvaluatorROS:
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
             # "/camera/color/image_raw", ROSImage, self.rgb_callback, queue_size=1
-            "/zed/zed_node/rgb/image_rect_color", ROSImage, self.rgb_callback, queue_size=1
+            "/zed/zed_node/rgb/image_rect_color",
+            ROSImage,
+            self.rgb_callback,
+            queue_size=1,
         )
         self.depth_sub = rospy.Subscriber(
             # "/camera/aligned_depth_to_color/image_raw",
             "/zed/zed_node/depth/depth_registered",
+            # "/depth_anything_v2/depth",
             ROSImage,
             self.depth_callback,
             queue_size=1,
@@ -383,16 +387,10 @@ class FoundationPoseEvaluatorROS:
             )
 
     def process_rgb(self, rgb):
-        rospy.logdebug(f"rgb.shape = {rgb.shape}")
-        rgb = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_NEAREST)
-        rospy.logdebug(f"AFTER rgb.shape = {rgb.shape}")
         rospy.logdebug(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
         return rgb
 
     def process_depth(self, depth):
-        rospy.logdebug(f"depth.shape = {depth.shape}")
-        depth = cv2.resize(depth, (640, 360), interpolation=cv2.INTER_NEAREST)
-        rospy.logdebug(f"AFTER depth.shape = {depth.shape}")
         rospy.logdebug(
             f"depth: {depth.shape}, {depth.dtype}, {np.max(depth)}, {np.min(depth)}, {np.mean(depth)}, {np.median(depth)}"
         )
@@ -407,11 +405,7 @@ class FoundationPoseEvaluatorROS:
         return depth
 
     def process_mask(self, mask):
-        rospy.logdebug(f"mask.shape = {mask.shape}")
-        mask = cv2.resize(mask, (640, 360), interpolation=cv2.INTER_NEAREST).astype(
-            bool
-        )
-        rospy.logdebug(f"AFTER mask.shape = {mask.shape}")
+        mask = mask.astype(bool)
         rospy.logdebug(
             f"mask: {mask.shape}, {mask.dtype}, {np.max(mask)}, {np.min(mask)}"
         )
