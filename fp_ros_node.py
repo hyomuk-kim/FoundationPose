@@ -13,11 +13,12 @@ import trimesh
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Int32
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
-from fp_ros_utils import get_cam_K, get_mesh_file
+from fp_ros_utils import get_mesh_file
 from Utils import (
     depth2xyzmap,
     draw_posed_3d_box,
@@ -36,6 +37,7 @@ class FoundationPoseROS:
         # Variables for storing the latest images
         self.latest_rgb = None
         self.latest_depth = None
+        self.latest_cam_K = None
         self.latest_mask = None
         self.is_object_registered = False
 
@@ -75,9 +77,6 @@ class FoundationPoseROS:
         )
         logging.info("Estimator initialization done")
 
-        # Camera parameters
-        self.cam_K = get_cam_K()
-
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
             # "/camera/color/image_raw",
@@ -96,6 +95,13 @@ class FoundationPoseROS:
         )
         self.mask_sub = rospy.Subscriber(
             "/sam2_mask", ROSImage, self.mask_callback, queue_size=1
+        )
+        self.cam_K_sub = rospy.Subscriber(
+            # "/camera/color/camera_info",
+            "/zed/zed_node/rgb/camera_info",
+            CameraInfo,
+            self.cam_K_callback,
+            queue_size=1,
         )
         self.reset_sub = rospy.Subscriber(
             "/reset", Int32, self.reset_callback, queue_size=1
@@ -124,6 +130,9 @@ class FoundationPoseROS:
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert mask image: {e}")
 
+    def cam_K_callback(self, data: CameraInfo):
+        self.latest_cam_K = np.array(data.K).reshape(3, 3)
+
     def reset_callback(self, data):
         if data.data > 0:
             rospy.loginfo("Resetting the node")
@@ -139,15 +148,17 @@ class FoundationPoseROS:
             self.latest_rgb is None
             or self.latest_depth is None
             or self.latest_mask is None
+            or self.latest_cam_K is None
         ):
             rospy.loginfo(
-                "Missing one of the required images (RGB, depth, mask). Waiting..."
+                "Missing one of the required images (RGB, depth, mask, cam_K). Waiting..."
             )
             rospy.sleep(0.1)
 
         assert self.latest_rgb is not None
         assert self.latest_depth is not None
         assert self.latest_mask is not None
+        assert self.latest_cam_K is not None
 
         while not rospy.is_shutdown():
             if not self.is_object_registered:
@@ -159,11 +170,12 @@ class FoundationPoseROS:
                 first_rgb = self.process_rgb(self.latest_rgb)
                 first_depth = self.process_depth(self.latest_depth)
                 first_mask = self.process_mask(self.latest_mask)
+                first_cam_K = self.latest_cam_K.copy()
 
                 # Estimation and tracking
                 t0 = time.time()
                 pose = self.FPModel.register(
-                    K=self.cam_K,
+                    K=first_cam_K,
                     rgb=first_rgb,
                     depth=first_depth,
                     ob_mask=first_mask,
@@ -178,7 +190,7 @@ class FoundationPoseROS:
                     m = self.object_mesh.copy()
                     m.apply_transform(pose)
                     m.export(f"{self.debug_dir}/model_tf.obj")
-                    xyz_map = depth2xyzmap(first_depth, self.cam_K)
+                    xyz_map = depth2xyzmap(first_depth, first_cam_K)
                     valid = first_depth >= 0.001
                     pcd = toOpen3dCloud(xyz_map[valid], first_rgb[valid])
                     pcd_path = f"{self.debug_dir}/scene_complete.ply"
@@ -195,10 +207,11 @@ class FoundationPoseROS:
                 rgb = self.process_rgb(self.latest_rgb)
                 depth = self.process_depth(self.latest_depth)
                 _mask = self.process_mask(self.latest_mask)
+                cam_K = self.latest_cam_K.copy()
 
                 t0 = time.time()
                 pose = self.FPModel.track_one(
-                    rgb=rgb, depth=depth, K=self.cam_K, iteration=self.track_refine_iter
+                    rgb=rgb, depth=depth, K=cam_K, iteration=self.track_refine_iter
                 )
                 rospy.loginfo(f"time for track is = {(time.time() - t0)*1000} ms")
 
@@ -212,13 +225,13 @@ class FoundationPoseROS:
                     vis_img = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
 
                     vis_img = draw_posed_3d_box(
-                        self.cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
+                        cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
                     )
                     vis_img = draw_xyz_axis(
                         vis_img,
                         ob_in_cam=center_pose,
                         scale=0.1,
-                        K=self.cam_K,
+                        K=cam_K,
                         thickness=3,
                         transparency=0,
                         is_input_rgb=True,

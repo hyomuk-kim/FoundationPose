@@ -20,21 +20,3 @@ def get_mesh_file() -> str:
     assert isinstance(mesh_file, str), f"mesh_file: {mesh_file}"
     assert os.path.exists(mesh_file), f"Mesh file does not exist: {mesh_file}"
     return mesh_file
-
-
-def get_cam_K() -> np.ndarray:
-    cam_K_file = rospy.get_param("/cam_K_file", None)
-    if cam_K_file is None:
-        code_dir = os.path.dirname(os.path.realpath(__file__))
-        DEFAULT_CAM_K_FILE = (
-            f"{code_dir}/demo_data/blueblock/blueblock_occ_slide/cam_K.txt"
-        )
-        rospy.logwarn(
-            f"Camera intrinsics file not provided. Using default file: {DEFAULT_CAM_K_FILE}"
-        )
-        cam_K_file = DEFAULT_CAM_K_FILE
-    assert isinstance(cam_K_file, str), f"cam_K_file: {cam_K_file}"
-
-    rospy.loginfo(f"cam_K_file = {cam_K_file}")
-    cam_K = np.loadtxt(cam_K_file).reshape(3, 3)
-    return cam_K

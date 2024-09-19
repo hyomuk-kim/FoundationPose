@@ -11,10 +11,11 @@ import trimesh
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Header, Int32
 
-from fp_ros_utils import get_cam_K, get_mesh_file
+from fp_ros_utils import get_mesh_file
 from Utils import (
     draw_posed_3d_box,
     draw_xyz_axis,
@@ -184,6 +185,7 @@ class FoundationPoseEvaluatorROS:
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_mask = None
+        self.latest_cam_K = None
         self.latest_pose = None
         self.frame_count = 0
 
@@ -196,9 +198,6 @@ class FoundationPoseEvaluatorROS:
         self.object_mesh = trimesh.load(mesh_file)
         self.to_origin, extents = trimesh.bounds.oriented_bounds(self.object_mesh)
         self.bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
-
-        # Camera parameters
-        self.cam_K = get_cam_K()
 
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
@@ -218,6 +217,13 @@ class FoundationPoseEvaluatorROS:
         )
         self.mask_sub = rospy.Subscriber(
             "/sam2_mask", ROSImage, self.mask_callback, queue_size=1
+        )
+        self.cam_K_sub = rospy.Subscriber(
+            # "/camera/color/camera_info",
+            "/zed/zed_node/rgb/camera_info",
+            CameraInfo,
+            self.cam_K_callback,
+            queue_size=1,
         )
         self.pose_sub = rospy.Subscriber(
             "/object_pose", Pose, self.pose_callback, queue_size=1
@@ -257,6 +263,9 @@ class FoundationPoseEvaluatorROS:
         except CvBridgeError as e:
             rospy.logerr(f"Could not convert mask image: {e}")
 
+    def cam_K_callback(self, data: CameraInfo):
+        self.latest_cam_K = np.array(data.K).reshape(3, 3)
+
     def pose_callback(self, data: Pose):
         xyz = np.array([data.position.x, data.position.y, data.position.z])
         quat_xyzw = np.array(
@@ -280,36 +289,36 @@ class FoundationPoseEvaluatorROS:
             self.latest_rgb is None
             or self.latest_depth is None
             or self.latest_mask is None
+            or self.latest_cam_K is None
             or self.latest_pose is None
         ):
             rospy.loginfo(
-                "Missing one of the required images (RGB, depth, mask) or pose. Waiting..."
+                "Missing one of the required images (RGB, depth, mask, cam_K) or pose. Waiting..."
             )
             rospy.sleep(0.1)
 
         assert self.latest_rgb is not None
         assert self.latest_depth is not None
         assert self.latest_mask is not None
+        assert self.latest_cam_K is not None
         assert self.latest_pose is not None
 
         while not rospy.is_shutdown():
-            ##############################
-            # Track
-            ##############################
             start_time = rospy.Time.now()
 
             logging.info(f"Processing frame: {self.frame_count}")
             rgb = self.process_rgb(self.latest_rgb)
             _depth = self.process_depth(self.latest_depth)
             mask = self.process_mask(self.latest_mask)
+            cam_K = self.latest_cam_K.copy()
             pose = self.latest_pose.copy()
 
             height, width = mask.shape[:2]
             t0 = time.time()
             predicted_depth, predicted_mask = render_depth_and_mask_cache(
-                self.object_mesh,
-                pose,
-                self.cam_K,
+                trimesh_obj=self.object_mesh,
+                T_C_O=pose,
+                K=cam_K,
                 image_width=width,
                 image_height=height,
             )
@@ -369,13 +378,13 @@ class FoundationPoseEvaluatorROS:
                 vis_img = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
 
                 vis_img = draw_posed_3d_box(
-                    self.cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
+                    cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
                 )
                 vis_img = draw_xyz_axis(
                     vis_img,
                     ob_in_cam=center_pose,
                     scale=0.1,
-                    K=self.cam_K,
+                    K=cam_K,
                     thickness=3,
                     transparency=0,
                     is_input_rgb=True,
