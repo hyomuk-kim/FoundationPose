@@ -40,9 +40,11 @@ class FoundationPoseROS:
         self.latest_cam_K = None
         self.latest_mask = None
         self.is_object_registered = False
+        self.first = True
 
-        self.est_refine_iter = 1  # Want this as low as possible to run as fast as possible (roughly 1 second for each iter?)
-        self.track_refine_iter = 2  # Want this as low as possible to run as fast as possible (1 seems to be too low though)
+        self.first_est_refine_iter = 5  # Can be higher since we only run this once at the very first time to get a good initial pose
+        self.est_refine_iter = 1  # Want this as low as possible to run as fast as possible when re-initializing pose (roughly 1 second for each iter?)
+        self.track_refine_iter = 2  # Want this as low as possible to run as fast as possible for more accurate tracking (1 seems to be too low though)
 
         # Debugging
         code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -163,26 +165,30 @@ class FoundationPoseROS:
         while not rospy.is_shutdown():
             if not self.is_object_registered:
                 ##############################
-                # Run first time
+                # Register
                 ##############################
-                rospy.loginfo("Running the first frame")
+                rospy.loginfo("Running registration")
 
-                first_rgb = self.process_rgb(self.latest_rgb)
-                first_depth = self.process_depth(self.latest_depth)
-                first_mask = self.process_mask(self.latest_mask)
-                first_cam_K = self.latest_cam_K.copy()
+                register_rgb = self.process_rgb(self.latest_rgb)
+                register_depth = self.process_depth(self.latest_depth)
+                register_mask = self.process_mask(self.latest_mask)
+                register_cam_K = self.latest_cam_K.copy()
 
                 # Estimation and tracking
                 t0 = time.time()
                 pose = self.FPModel.register(
-                    K=first_cam_K,
-                    rgb=first_rgb,
-                    depth=first_depth,
-                    ob_mask=first_mask,
-                    iteration=self.est_refine_iter,
+                    K=register_cam_K,
+                    rgb=register_rgb,
+                    depth=register_depth,
+                    ob_mask=register_mask,
+                    iteration=(
+                        self.first_est_refine_iter
+                        if self.first
+                        else self.est_refine_iter
+                    ),
                 )
                 rospy.loginfo(f"time for reg mask is = {(time.time() - t0)*1000} ms")
-                logging.info("First frame estimation done")
+                logging.info("Registration done")
                 rospy.loginfo(f"pose = {pose}")
                 assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
 
@@ -190,14 +196,15 @@ class FoundationPoseROS:
                     m = self.object_mesh.copy()
                     m.apply_transform(pose)
                     m.export(f"{self.debug_dir}/model_tf.obj")
-                    xyz_map = depth2xyzmap(first_depth, first_cam_K)
-                    valid = first_depth >= 0.001
-                    pcd = toOpen3dCloud(xyz_map[valid], first_rgb[valid])
+                    xyz_map = depth2xyzmap(register_depth, register_cam_K)
+                    valid = register_depth >= 0.001
+                    pcd = toOpen3dCloud(xyz_map[valid], register_rgb[valid])
                     pcd_path = f"{self.debug_dir}/scene_complete.ply"
                     o3d.io.write_point_cloud(pcd_path, pcd)
                     rospy.loginfo(f"Point cloud saved to {pcd_path}")
 
                 self.is_object_registered = True
+                self.first = False
             else:
                 ##############################
                 # Track
