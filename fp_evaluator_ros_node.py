@@ -13,7 +13,7 @@ from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
-from std_msgs.msg import Header, Int32
+from std_msgs.msg import Header, Int32, Float32
 
 from fp_ros_utils import get_mesh_file
 from Utils import (
@@ -230,6 +230,7 @@ class FoundationPoseEvaluatorROS:
         )
 
         # Publisher for the object pose
+        self.iou_pub = rospy.Publisher("/iou", Float32, queue_size=1)
         self.reset_pub = rospy.Publisher("/reset", Int32, queue_size=1)
         self.predicted_mask_pub = rospy.Publisher("/fp_mask", ROSImage, queue_size=1)
 
@@ -327,6 +328,8 @@ class FoundationPoseEvaluatorROS:
 
             rospy.loginfo("=" * 100)
             rospy.loginfo(f"IoU: {iou}")
+            self.iou_pub.publish(Float32(data=iou))
+
             """
             Send the reset signal only under certain conditions to avoid false positives
             1. Do not send a reset signal if it sent one in the last RESET_COOLDOWN_TIME_SEC seconds
