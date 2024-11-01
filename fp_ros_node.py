@@ -79,17 +79,33 @@ class FoundationPoseROS:
         )
         logging.info("Estimator initialization done")
 
+        # Check camera parameter
+        camera = rospy.get_param("/camera", None)
+        if camera is None:
+            DEFAULT_CAMERA = "zed"
+            rospy.logwarn(f"No /camera parameter found, using default camera {DEFAULT_CAMERA}")
+            camera = DEFAULT_CAMERA
+        rospy.loginfo(f"Using camera: {camera}")
+        if camera == "zed":
+            self.rgb_sub_topic = "/zed/zed_node/rgb/image_rect_color"
+            self.depth_sub_topic = "/zed/zed_node/depth/depth_registered"
+            self.camera_info_sub_topic = "/zed/zed_node/rgb/camera_info"
+        elif camera == "realsense":
+            self.rgb_sub_topic = "/camera/color/image_raw"
+            self.depth_sub_topic = "/camera/aligned_depth_to_color/image_raw"
+            self.camera_info_sub_topic = "/camera/color/camera_info"
+        else:
+            raise ValueError(f"Unknown camera: {camera}")
+
         # Subscribers for RGB, depth, and mask images
         self.rgb_sub = rospy.Subscriber(
-            # "/camera/color/image_raw",
-            "/zed/zed_node/rgb/image_rect_color",
+            self.rgb_sub_topic,
             ROSImage,
             self.rgb_callback,
             queue_size=1,
         )
         self.depth_sub = rospy.Subscriber(
-            # "/camera/aligned_depth_to_color/image_raw",
-            "/zed/zed_node/depth/depth_registered",
+            self.depth_sub_topic,
             # "/depth_anything_v2/depth",
             ROSImage,
             self.depth_callback,
@@ -99,8 +115,7 @@ class FoundationPoseROS:
             "/sam2_mask", ROSImage, self.mask_callback, queue_size=1
         )
         self.cam_K_sub = rospy.Subscriber(
-            # "/camera/color/camera_info",
-            "/zed/zed_node/rgb/camera_info",
+            self.camera_info_sub_topic,
             CameraInfo,
             self.cam_K_callback,
             queue_size=1,
