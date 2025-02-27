@@ -246,7 +246,7 @@ class FoundationPoseEvaluatorROS:
 
         # Publisher for the object pose
         self.iou_pub = rospy.Publisher("/iou", Float32, queue_size=1)
-        self.reset_pub = rospy.Publisher("/reset", Int32, queue_size=1)
+        self.reset_pub = rospy.Publisher("/fp_reset", Int32, queue_size=1)
         self.predicted_mask_pub = rospy.Publisher("/fp_mask", ROSImage, queue_size=1)
 
         RATE_HZ = 10

@@ -121,7 +121,7 @@ class FoundationPoseROS:
             queue_size=1,
         )
         self.reset_sub = rospy.Subscriber(
-            "/reset", Int32, self.reset_callback, queue_size=1
+            "/fp_reset", Int32, self.reset_callback, queue_size=1
         )
 
         # Publisher for the object pose
@@ -152,7 +152,7 @@ class FoundationPoseROS:
 
     def reset_callback(self, data):
         if data.data > 0:
-            rospy.loginfo("Resetting the node")
+            rospy.loginfo("Resetting the fp node")
             self.is_object_registered = False
         else:
             rospy.loginfo("Received a reset message with data <= 0")
