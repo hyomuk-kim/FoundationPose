@@ -18,19 +18,16 @@ This video shows FoundationPose working at ~40Hz.
 ```mermaid
 flowchart LR
     subgraph "Inputs"
-        A[""]
-        B[""]
-        C[""]
+        A["&lt;rgb_topic&gt;"]
+        B["&lt;depth_topic&gt;"]
+        C["&lt;cam_intrinsics&gt;"]
         D["/sam2_mask"]
         E["/fp_reset"]
     end
-
     FP["fp_node"]
-
     subgraph "Outputs"
         F["/object_pose"]
     end
-
     A --> FP
     B --> FP
     C --> FP
@@ -51,19 +48,16 @@ flowchart LR
 ```mermaid
 flowchart LR
     subgraph "Inputs"
-        G[""]
+        G["&lt;cam_intrinsics&gt;"]
         H["/sam2_mask"]
         I["/object_pose"]
     end
-
     FPE["fp_evaluator_node"]
-
     subgraph "Outputs"
         J["/iou"]
         K["/fp_reset"]
         L["/fp_mask"]
     end
-
     G --> FPE
     H --> FPE
     I --> FPE
