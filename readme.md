@@ -113,13 +113,6 @@ Note that we keep the `fp_ros_node.py` as simple as possible because we need Fou
 ## HOW TO RUN
 
 ### Docker
-This is a live example that uses 4 components:
-
-1. RealSense camera: `roslaunch realsense2_camera rs_camera.launch align_depth:=true`
-2. Real-Time SAM2 with smart prompting: https://github.com/tylerlum/segment-anything-2-real-time
-3. FoundationPose pose tracking: https://github.com/tylerlum/FoundationPose/
-4. FoundationPose evaluation for resetting the tracker: https://github.com/tylerlum/FoundationPose/
-
 
 We needed to use Docker. Using conda alone did not work, despite lots of effort.
 
@@ -129,6 +122,20 @@ cd docker/
 docker build --network host -f ros_dockerfile -t ros_foundationpose .
 bash docker/run_ros_container.sh
 ```
+
+If you have Docker permission issues, you may need to do the following:
+```
+# Source: https://medium.com/@praveenadoni4456/error-got-permission-denied-while-trying-to-connect-to-the-docker-daemon-socket-at-e68bfab8146a
+# start docker daemon
+sudo systemctl start docker
+
+# enable docker permissions
+sudo groupadd docker
+sudo usermod -aG docker ${USER}
+sudo chmod 666 /var/run/docker.sock
+sudo systemctl restart docker
+```
+
 
 If it's the first time you launch the container, you need to build extensions from inside the container.
 ```
