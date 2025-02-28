@@ -5,15 +5,100 @@
 
 ## EXAMPLE VIDEO
 
-This is a live example that uses 4 components:
+This is an example that demonstrates the reasonable robustness FoundationPose, with the help of the Segment Anything Model 2 (SAM2) model to initialize FoundationPose and reset FoundationPose when the object is lost. If the SAM2 mask (very accurate) is very different from the FoundationPose prediction's mask (less accurate), the tracker will reset.
 
-1. RealSense camera: `roslaunch realsense2_camera rs_camera.launch align_depth:=true`
-2. Real-Time SAM2 with smart prompting: https://github.com/tylerlum/segment-anything-2-real-time
-3. FoundationPose pose tracking: https://github.com/tylerlum/FoundationPose/
-4. FoundationPose evaluation for resetting the tracker: https://github.com/tylerlum/FoundationPose/
+This video shows FoundationPose working at ~40Hz.
 
 [2024-09-08_SAM2_FP_Robust_compressed.webm](https://github.com/user-attachments/assets/892a984a-571d-4451-bf69-15415800981c)
 
+## INPUTS AND OUTPUTS
+
+### FP ROS NODE
+
+```mermaid
+flowchart LR
+    subgraph "Inputs"
+        A[""]
+        B[""]
+        C[""]
+        D["/sam2_mask"]
+        E["/fp_reset"]
+    end
+
+    FP["fp_node"]
+
+    subgraph "Outputs"
+        F["/object_pose"]
+    end
+
+    A --> FP
+    B --> FP
+    C --> FP
+    D --> FP
+    E --> FP
+    FP --> F
+```
+
+* `<rgb_topic>` is the topic for RGB image data
+* `<depth_topic>` is the topic for depth image data
+* `<cam_intrinsics>` provides the 3x3 camera intrinsics matrix
+* `sam2_mask` is the mask of the object provided by the SAM2 node
+* `fp_reset` is a boolean trigger to reset the pose estimation model
+* `object_pose` is the estimated 6D pose of the detected object
+
+### FP EVALUATOR ROS NODE
+
+```mermaid
+flowchart LR
+    subgraph "Inputs"
+        G[""]
+        H["/sam2_mask"]
+        I["/object_pose"]
+    end
+
+    FPE["fp_evaluator_node"]
+
+    subgraph "Outputs"
+        J["/iou"]
+        K["/fp_reset"]
+        L["/fp_mask"]
+    end
+
+    G --> FPE
+    H --> FPE
+    I --> FPE
+    FPE --> J
+    FPE --> K
+    FPE --> L
+```
+
+* `<cam_intrinsics>` provides the 3x3 camera intrinsics matrix
+* `sam2_mask` is the mask of the object provided by the SAM2 node
+* `object_pose` is the estimated 6D pose from the fp_node
+* `iou` is the intersection over union of the SAM2 mask and the mask generated from the predicted pose
+* `fp_reset` is 0 in normal operation, but 1 if the IOU is less than a threshold, triggering a reset of the fp_node
+* `fp_mask` is the segmentation mask generated from the predicted pose
+
+### Parameters
+
+You should set the following ROS parameters:
+```
+rosparam set /camera zed  # zed or realsense
+rosparam set /mesh_file /path/to/mesh.obj  # Object to be tracked
+```
+
+This sets the topics to be used
+
+```
+if camera == "zed":
+    self.rgb_sub_topic = "/zed/zed_node/rgb/image_rect_color"
+    self.depth_sub_topic = "/zed/zed_node/depth/depth_registered"
+    self.camera_info_sub_topic = "/zed/zed_node/rgb/camera_info"
+elif camera == "realsense":
+    self.rgb_sub_topic = "/camera/color/image_raw"
+    self.depth_sub_topic = "/camera/aligned_depth_to_color/image_raw"
+    self.camera_info_sub_topic = "/camera/color/camera_info"
+```
 
 ## CHANGES
 
@@ -28,6 +113,13 @@ Note that we keep the `fp_ros_node.py` as simple as possible because we need Fou
 ## HOW TO RUN
 
 ### Docker
+This is a live example that uses 4 components:
+
+1. RealSense camera: `roslaunch realsense2_camera rs_camera.launch align_depth:=true`
+2. Real-Time SAM2 with smart prompting: https://github.com/tylerlum/segment-anything-2-real-time
+3. FoundationPose pose tracking: https://github.com/tylerlum/FoundationPose/
+4. FoundationPose evaluation for resetting the tracker: https://github.com/tylerlum/FoundationPose/
+
 
 We needed to use Docker. Using conda alone did not work, despite lots of effort.
 
@@ -53,7 +145,7 @@ If you close the container, open again with
 bash docker/run_ros_container.sh
 ```
 
-### Test If It Works
+### Run on offline data
 
 ```
 docker exec -it ros_foundationpose bash
@@ -78,36 +170,61 @@ find $CONDA_PREFIX -name "*libstdc++.so*"
 export LD_LIBRARY_PATH=/opt/conda/envs/my/lib:$LD_LIBRARY_PATH  # Replace if yours is different
 ```
 
-### Run ROS
-In a terminal:
+### Run real-time pose estimation with ROS
+
+This is a real-time example that uses 4 components:
+
+1. RGB-D Camera
+2. Real-Time SAM2 with smart prompting (initializes pose tracker and resets it if object is lost): https://github.com/tylerlum/segment-anything-2-real-time
+3. FoundationPose pose tracking (pose tracking): https://github.com/tylerlum/FoundationPose/
+4. FoundationPose evaluation for resetting the tracker (converts pose prediction to a predicted mask, and resets the tracker if the mask is poor compared to the SAM2 mask): https://github.com/tylerlum/FoundationPose/
+
+First run the camera with something like:
+
+```
+roslaunch realsense2_camera rs_camera.launch align_depth:=true
+roslaunch zed_wrapper zed.launch
+```
+
+Check you can see the topics:
+```
+rostopic list  # See expected topics
+```
+
+If you are running across PCs, set the following for each terminal:
+```
+# Set ROS variables if running across PCs
+export ROS_MASTER_URI=http://bohg-ws-5.stanford.edu:11311  # Master machine
+export ROS_HOSTNAME=$(hostname)  # This machine (e.g., bohg-ws-19.stanford.edu)
+```
+
+In a terminal, run the SAM2 node:
+```
+python sam2_ros_node.py
+```
+
+In another terminal, run the FoundationPose node:
 ```
 docker exec -it ros_foundationpose bash
-
-# Set ROS variables if running across PCs
-export ROS_MASTER_URI=http://bohg-franka.stanford.edu:11311  # Master machine
-export ROS_HOSTNAME=bohg-ws-19.stanford.edu  # This machine
 
 python fp_ros_node.py
 ```
 
-In a terminal:
+In another terminal, run the evaluator node:
 ```
 docker exec -it ros_foundationpose bash
-
-# Set ROS variables if running across PCs
-export ROS_MASTER_URI=http://bohg-franka.stanford.edu:11311  # Master machine
-export ROS_HOSTNAME=bohg-ws-19.stanford.edu  # This machine
 
 python fp_evaluator_ros_node.py
 ```
 
-If things are not working, make sure that you can do things like:
+Sanity check that the camera is working by viewing the RGB-D images and the FoundationPose predicted mask (good to compare with the SAM2 mask):
 ```
-roscore  # ROS works
+rqt_image_view &
 ```
 
+You can visualize debug signals /sam2_reset and /sam2_num_mask_pixels with:
 ```
-rostopic list  # See expected topics
+rqt_plot
 ```
 
 # ORIGINAL DOCUMENTATION
