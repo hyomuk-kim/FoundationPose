@@ -41,7 +41,7 @@ flowchart LR
 * `<cam_intrinsics>` provides the 3x3 camera intrinsics matrix
 * `sam2_mask` is the mask of the object provided by the SAM2 node
 * `fp_reset` is a boolean trigger to reset the pose estimation model
-* `object_pose` is the estimated 6D pose of the detected object
+* `object_pose` is the estimated 6D pose of the detected object (in camera frame)
 
 ### FP EVALUATOR ROS NODE
 
@@ -68,7 +68,7 @@ flowchart LR
 
 * `<cam_intrinsics>` provides the 3x3 camera intrinsics matrix
 * `sam2_mask` is the mask of the object provided by the SAM2 node
-* `object_pose` is the estimated 6D pose from the fp_node (in camera frame)
+* `object_pose` is the estimated 6D pose from the fp_node
 * `iou` is the intersection over union of the SAM2 mask and the mask generated from the predicted pose
 * `fp_reset` is 0 in normal operation, but 1 if the IOU is less than a threshold, triggering a reset of the fp_node
 * `fp_mask` is the segmentation mask generated from the predicted pose
