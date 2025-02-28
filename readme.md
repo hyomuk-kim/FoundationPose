@@ -3,6 +3,8 @@
 
 # TYLER DOCUMENTATION (September 8, 2024)
 
+NOTE: The purpose of this documentation is NOT to be super precise and detailed, but rather to be a quick reference for how to run the code and how it works.
+
 ## EXAMPLE VIDEO
 
 This is an example that demonstrates the reasonable robustness FoundationPose, with the help of the Segment Anything Model 2 (SAM2) model to initialize FoundationPose and reset FoundationPose when the object is lost. If the SAM2 mask (very accurate) is very different from the FoundationPose prediction's mask (less accurate), the tracker will reset.
