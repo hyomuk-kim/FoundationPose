@@ -78,13 +78,18 @@ class FoundationPoseROS:
             debug=self.debug,
             glctx=self.glctx,
         )
-        logging.info("Estimator initialization done")
+        print(colored("Estimator initialization done", "green"))
 
         # Check camera parameter
         camera = rospy.get_param("/camera", None)
         if camera is None:
             DEFAULT_CAMERA = "zed"
-            print(colored(f"No /camera parameter found, using default camera {DEFAULT_CAMERA}", "yellow"))
+            print(
+                colored(
+                    f"No /camera parameter found, using default camera {DEFAULT_CAMERA}",
+                    "yellow",
+                )
+            )
             camera = DEFAULT_CAMERA
         print(colored(f"Using camera: {camera}", "green"))
         if camera == "zed":
@@ -166,7 +171,12 @@ class FoundationPoseROS:
             or self.latest_mask is None
             or self.latest_cam_K is None
         ):
-            print(colored("Missing one of the required images (RGB, depth, mask, cam_K). Waiting...", "yellow"))
+            print(
+                colored(
+                    "Missing one of the required images (RGB, depth, mask, cam_K). Waiting...",
+                    "yellow",
+                )
+            )
             rospy.sleep(0.1)
 
         assert self.latest_rgb is not None
@@ -199,8 +209,13 @@ class FoundationPoseROS:
                         else self.est_refine_iter
                     ),
                 )
-                print(colored(f"time for reg mask is = {(time.time() - t0)*1000} ms", "green"))
-                logging.info("Registration done")
+                print(
+                    colored(
+                        f"time for reg mask is = {(time.time() - t0) * 1000} ms",
+                        "green",
+                    )
+                )
+                print(colored("Registration done", "green"))
                 print(colored(f"pose = {pose}", "green"))
                 assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
 
@@ -232,7 +247,11 @@ class FoundationPoseROS:
                 pose = self.FPModel.track_one(
                     rgb=rgb, depth=depth, K=cam_K, iteration=self.track_refine_iter
                 )
-                print(colored(f"time for track is = {(time.time() - t0)*1000} ms", "green"))
+                print(
+                    colored(
+                        f"time for track is = {(time.time() - t0) * 1000} ms", "green"
+                    )
+                )
 
                 # Publish pose
                 self.publish_pose(pose)
@@ -260,7 +279,12 @@ class FoundationPoseROS:
                     cv2.waitKey(1)
 
                 done_time = rospy.Time.now()
-                print(colored(f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec()*1000)} ms)", "green"))
+                print(
+                    colored(
+                        f"Max rate: {np.round(1.0 / (done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec() * 1000)} ms)",
+                        "green",
+                    )
+                )
 
     def process_rgb(self, rgb):
         return rgb

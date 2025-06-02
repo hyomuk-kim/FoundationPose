@@ -15,6 +15,7 @@ from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Header, Int32, Float32
 from termcolor import colored
+import argparse
 
 from fp_ros_utils import get_mesh_file
 from Utils import (
@@ -204,7 +205,12 @@ class FoundationPoseEvaluatorROS:
         camera = rospy.get_param("/camera", None)
         if camera is None:
             DEFAULT_CAMERA = "zed"
-            print(colored(f"No /camera parameter found, using default camera {DEFAULT_CAMERA}", "yellow"))
+            print(
+                colored(
+                    f"No /camera parameter found, using default camera {DEFAULT_CAMERA}",
+                    "yellow",
+                )
+            )
             camera = DEFAULT_CAMERA
         print(colored(f"Using camera: {camera}", "green"))
         if camera == "zed":
@@ -298,7 +304,7 @@ class FoundationPoseEvaluatorROS:
         latest_pose[:3, :3] = R.from_quat(quat_xyzw).as_matrix()
         self.latest_pose = latest_pose
 
-    def run(self):
+    def run(self, visualize: bool = False):
         ##############################
         # Wait for the first images
         ##############################
@@ -309,7 +315,12 @@ class FoundationPoseEvaluatorROS:
             or self.latest_cam_K is None
             or self.latest_pose is None
         ):
-            print(colored("Missing one of the required images (RGB, depth, mask, cam_K) or pose. Waiting...", "yellow"))
+            print(
+                colored(
+                    "Missing one of the required images (RGB, depth, mask, cam_K) or pose. Waiting...",
+                    "yellow",
+                )
+            )
             rospy.sleep(0.1)
 
         assert self.latest_rgb is not None
@@ -337,7 +348,11 @@ class FoundationPoseEvaluatorROS:
                 image_width=width,
                 image_height=height,
             )
-            print(colored(f"time for pred mask is = {(time.time() - t0)*1000} ms", "green"))
+            print(
+                colored(
+                    f"time for pred mask is = {(time.time() - t0) * 1000} ms", "green"
+                )
+            )
             iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
 
             print(colored("=" * 100, "green"))
@@ -358,7 +373,12 @@ class FoundationPoseEvaluatorROS:
                 if rospy.Time.now() - self.last_reset_time < rospy.Duration(
                     self.RESET_COOLDOWN_TIME_SEC
                 ):
-                    print(colored(f"Waiting for the reset cooldown period of {self.RESET_COOLDOWN_TIME_SEC} seconds to end. Been {rospy.Time.now() - self.last_reset_time} seconds", "green"))
+                    print(
+                        colored(
+                            f"Waiting for the reset cooldown period of {self.RESET_COOLDOWN_TIME_SEC} seconds to end. Been {rospy.Time.now() - self.last_reset_time} seconds",
+                            "green",
+                        )
+                    )
                     self.invalid_counter = 0
                 else:
                     self.invalid_counter += 1
@@ -370,7 +390,12 @@ class FoundationPoseEvaluatorROS:
                     self.invalid_counter = 0
                     self.last_reset_time = rospy.Time.now()
                 else:
-                    print(colored(f"Waiting for {self.INVALID_THRESHOLD_SEC} consecutive seconds ({self.invalid_counter_threshold} frames) of mismatch to reset the scene.", "yellow"))
+                    print(
+                        colored(
+                            f"Waiting for {self.INVALID_THRESHOLD_SEC} consecutive seconds ({self.invalid_counter_threshold} frames) of mismatch to reset the scene.",
+                            "yellow",
+                        )
+                    )
             self.reset_pub.publish(reset_msg)
 
             # Convert OpenCV image (mask) to ROS Image message
@@ -383,8 +408,7 @@ class FoundationPoseEvaluatorROS:
             self.predicted_mask_pub.publish(mask_msg)
             print(colored("Predicted mask published to /fp_mask", "green"))
 
-            VISUALIZE = True
-            if VISUALIZE:
+            if visualize:
                 center_pose = pose @ np.linalg.inv(self.to_origin)
 
                 # Must be BGR for cv2
@@ -409,7 +433,12 @@ class FoundationPoseEvaluatorROS:
             done_time = rospy.Time.now()
             self.rate.sleep()
             after_sleep_time = rospy.Time.now()
-            print(colored(f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec() * 1000)} ms), Actual rate with sleep: {np.round(1./(after_sleep_time - start_time).to_sec())} Hz", "green"))
+            print(
+                colored(
+                    f"Max rate: {np.round(1.0 / (done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec() * 1000)} ms), Actual rate with sleep: {np.round(1.0 / (after_sleep_time - start_time).to_sec())} Hz",
+                    "green",
+                )
+            )
 
     def process_rgb(self, rgb):
         return rgb
@@ -442,5 +471,9 @@ class FoundationPoseEvaluatorROS:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--visualize", action="store_true")
+    args = parser.parse_args()
+
     node = FoundationPoseEvaluatorROS()
-    node.run()
+    node.run(args.visualize)

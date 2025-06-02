@@ -115,6 +115,7 @@ We needed to use Docker. Using conda alone did not work, despite lots of effort.
 ```
 # May need to add sudo to all docker commands (if not set up for your user)
 cd docker/
+docker build --network host -f dockerfile -t foundationpose .
 docker build --network host -f ros_dockerfile -t ros_foundationpose .
 cd ..
 
@@ -216,11 +217,23 @@ docker exec -it ros_foundationpose bash
 python fp_ros_node.py
 ```
 
-In another terminal, run the evaluator node:
+In another terminal, run the evaluator node (requires display):
 ```
 docker exec -it ros_foundationpose bash
 
-python fp_evaluator_ros_node.py
+# Run with visualization (requires a display)
+python fp_evaluator_ros_node.py --visualize
+```
+
+If you don't have a display, you can run without visualization (need some extra setup because of underlying code):
+```
+docker exec -it ros_foundationpose bash
+
+apt-get update && apt-get install -y \
+    libosmesa6 libosmesa6-dev libgl1-mesa-glx
+
+# Run without visualization
+PYOPENGL_PLATFORM=osmesa python fp_evaluator_ros_node.py
 ```
 
 Sanity check that the camera is working by viewing the RGB-D images and the FoundationPose predicted mask (good to compare with the SAM2 mask):
