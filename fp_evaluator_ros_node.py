@@ -14,6 +14,7 @@ from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Header, Int32, Float32
+from termcolor import colored
 
 from fp_ros_utils import get_mesh_file
 from Utils import (
@@ -203,9 +204,9 @@ class FoundationPoseEvaluatorROS:
         camera = rospy.get_param("/camera", None)
         if camera is None:
             DEFAULT_CAMERA = "zed"
-            rospy.logwarn(f"No /camera parameter found, using default camera {DEFAULT_CAMERA}")
+            print(colored(f"No /camera parameter found, using default camera {DEFAULT_CAMERA}", "yellow"))
             camera = DEFAULT_CAMERA
-        rospy.loginfo(f"Using camera: {camera}")
+        print(colored(f"Using camera: {camera}", "green"))
         if camera == "zed":
             self.rgb_sub_topic = "/zed/zed_node/rgb/image_rect_color"
             self.depth_sub_topic = "/zed/zed_node/depth/depth_registered"
@@ -265,19 +266,19 @@ class FoundationPoseEvaluatorROS:
         try:
             self.latest_rgb = self.bridge.imgmsg_to_cv2(data, "rgb8")
         except CvBridgeError as e:
-            rospy.logerr(f"Could not convert RGB image: {e}")
+            print(colored(f"Could not convert RGB image: {e}", "red"))
 
     def depth_callback(self, data):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(data, "64FC1")
         except CvBridgeError as e:
-            rospy.logerr(f"Could not convert depth image: {e}")
+            print(colored(f"Could not convert depth image: {e}", "red"))
 
     def mask_callback(self, data):
         try:
             self.latest_mask = self.bridge.imgmsg_to_cv2(data, "mono8")
         except CvBridgeError as e:
-            rospy.logerr(f"Could not convert mask image: {e}")
+            print(colored(f"Could not convert mask image: {e}", "red"))
 
     def cam_K_callback(self, data: CameraInfo):
         self.latest_cam_K = np.array(data.K).reshape(3, 3)
@@ -308,9 +309,7 @@ class FoundationPoseEvaluatorROS:
             or self.latest_cam_K is None
             or self.latest_pose is None
         ):
-            rospy.loginfo(
-                "Missing one of the required images (RGB, depth, mask, cam_K) or pose. Waiting..."
-            )
+            print(colored("Missing one of the required images (RGB, depth, mask, cam_K) or pose. Waiting...", "yellow"))
             rospy.sleep(0.1)
 
         assert self.latest_rgb is not None
@@ -338,11 +337,11 @@ class FoundationPoseEvaluatorROS:
                 image_width=width,
                 image_height=height,
             )
-            rospy.loginfo(f"time for pred mask is = {(time.time() - t0)*1000} ms")
+            print(colored(f"time for pred mask is = {(time.time() - t0)*1000} ms", "green"))
             iou, is_match = compare_masks(mask, predicted_mask, threshold=0.2)
 
-            rospy.loginfo("=" * 100)
-            rospy.loginfo(f"IoU: {iou}")
+            print(colored("=" * 100, "green"))
+            print(colored(f"IoU: {iou}", "green"))
             self.iou_pub.publish(Float32(data=iou))
 
             """
@@ -352,30 +351,26 @@ class FoundationPoseEvaluatorROS:
             """
             reset_msg = Int32(data=0)
             if is_match:
-                rospy.loginfo("Masks match within the threshold.")
+                print(colored("Masks match within the threshold.", "green"))
                 self.invalid_counter = 0
             else:
-                rospy.loginfo("Masks do not match within the threshold.")
+                print(colored("Masks do not match within the threshold.", "yellow"))
                 if rospy.Time.now() - self.last_reset_time < rospy.Duration(
                     self.RESET_COOLDOWN_TIME_SEC
                 ):
-                    rospy.loginfo(
-                        f"Waiting for the reset cooldown period of {self.RESET_COOLDOWN_TIME_SEC} seconds to end. Been {rospy.Time.now() - self.last_reset_time} seconds"
-                    )
+                    print(colored(f"Waiting for the reset cooldown period of {self.RESET_COOLDOWN_TIME_SEC} seconds to end. Been {rospy.Time.now() - self.last_reset_time} seconds", "green"))
                     self.invalid_counter = 0
                 else:
                     self.invalid_counter += 1
 
-                rospy.loginfo(f"Invalid counter: {self.invalid_counter}")
+                print(colored(f"Invalid counter: {self.invalid_counter}", "yellow"))
                 if self.invalid_counter >= self.invalid_counter_threshold:
-                    rospy.loginfo("Resetting the scene.")
+                    print(colored("Resetting the scene.", "green"))
                     reset_msg.data = 1
                     self.invalid_counter = 0
                     self.last_reset_time = rospy.Time.now()
                 else:
-                    rospy.loginfo(
-                        f"Waiting for {self.INVALID_THRESHOLD_SEC} consecutive seconds ({self.invalid_counter_threshold} frames) of mismatch to reset the scene."
-                    )
+                    print(colored(f"Waiting for {self.INVALID_THRESHOLD_SEC} consecutive seconds ({self.invalid_counter_threshold} frames) of mismatch to reset the scene.", "yellow"))
             self.reset_pub.publish(reset_msg)
 
             # Convert OpenCV image (mask) to ROS Image message
@@ -386,7 +381,7 @@ class FoundationPoseEvaluatorROS:
 
             # Publish the mask to the /fp_mask topic
             self.predicted_mask_pub.publish(mask_msg)
-            rospy.loginfo("Predicted mask published to /fp_mask")
+            print(colored("Predicted mask published to /fp_mask", "green"))
 
             VISUALIZE = True
             if VISUALIZE:
@@ -414,12 +409,9 @@ class FoundationPoseEvaluatorROS:
             done_time = rospy.Time.now()
             self.rate.sleep()
             after_sleep_time = rospy.Time.now()
-            rospy.loginfo(
-                f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec() * 1000)} ms), Actual rate with sleep: {np.round(1./(after_sleep_time - start_time).to_sec())} Hz"
-            )
+            print(colored(f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec() * 1000)} ms), Actual rate with sleep: {np.round(1./(after_sleep_time - start_time).to_sec())} Hz", "green"))
 
     def process_rgb(self, rgb):
-        rospy.logdebug(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
         return rgb
 
     def process_depth(self, depth):
@@ -432,10 +424,11 @@ class FoundationPoseEvaluatorROS:
         # If the max value is greater than 100, then it's likely in mm
         in_mm = depth.max() > 100
         if in_mm:
-            rospy.loginfo(f"Converting depth from mm to m since max = {depth.max()}")
+            # print(colored(f"Converting depth from mm to m since max = {depth.max()}", "green"))
             depth = depth / 1000
         else:
-            rospy.loginfo(f"Depth is in meters since max = {depth.max()}")
+            pass
+            # print(colored(f"Depth is in meters since max = {depth.max()}", "green"))
 
         # Clamp
         depth[depth < 0.1] = 0
@@ -445,9 +438,6 @@ class FoundationPoseEvaluatorROS:
 
     def process_mask(self, mask):
         mask = mask.astype(bool)
-        rospy.logdebug(
-            f"mask: {mask.shape}, {mask.dtype}, {np.max(mask)}, {np.min(mask)}"
-        )
         return mask
 
 

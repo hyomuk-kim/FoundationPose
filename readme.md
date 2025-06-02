@@ -116,6 +116,8 @@ We needed to use Docker. Using conda alone did not work, despite lots of effort.
 # May need to add sudo to all docker commands (if not set up for your user)
 cd docker/
 docker build --network host -f ros_dockerfile -t ros_foundationpose .
+cd ..
+
 bash docker/run_ros_container.sh
 ```
 
@@ -135,6 +137,7 @@ sudo systemctl restart docker
 
 If it's the first time you launch the container, you need to build extensions from inside the container.
 ```
+cd FoundationPose
 bash build_all.sh
 ```
 

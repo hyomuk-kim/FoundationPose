@@ -16,6 +16,7 @@ from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Int32
+from termcolor import colored
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from fp_ros_utils import get_mesh_file
@@ -83,9 +84,9 @@ class FoundationPoseROS:
         camera = rospy.get_param("/camera", None)
         if camera is None:
             DEFAULT_CAMERA = "zed"
-            rospy.logwarn(f"No /camera parameter found, using default camera {DEFAULT_CAMERA}")
+            print(colored(f"No /camera parameter found, using default camera {DEFAULT_CAMERA}", "yellow"))
             camera = DEFAULT_CAMERA
-        rospy.loginfo(f"Using camera: {camera}")
+        print(colored(f"Using camera: {camera}", "green"))
         if camera == "zed":
             self.rgb_sub_topic = "/zed/zed_node/rgb/image_rect_color"
             self.depth_sub_topic = "/zed/zed_node/depth/depth_registered"
@@ -130,32 +131,30 @@ class FoundationPoseROS:
     def rgb_callback(self, data):
         try:
             self.latest_rgb = self.bridge.imgmsg_to_cv2(data, "rgb8")
-            rospy.loginfo(f"Received RGB image: {self.latest_rgb.shape}")
         except CvBridgeError as e:
-            rospy.logerr(f"Could not convert RGB image: {e}")
+            print(colored(f"Could not convert RGB image: {e}", "red"))
 
     def depth_callback(self, data):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(data, "64FC1")
-            rospy.loginfo(f"Received depth image: {self.latest_depth.shape}")
         except CvBridgeError as e:
-            rospy.logerr(f"Could not convert depth image: {e}")
+            print(colored(f"Could not convert depth image: {e}", "red"))
 
     def mask_callback(self, data):
         try:
             self.latest_mask = self.bridge.imgmsg_to_cv2(data, "mono8")
         except CvBridgeError as e:
-            rospy.logerr(f"Could not convert mask image: {e}")
+            print(colored(f"Could not convert mask image: {e}", "red"))
 
     def cam_K_callback(self, data: CameraInfo):
         self.latest_cam_K = np.array(data.K).reshape(3, 3)
 
     def reset_callback(self, data):
         if data.data > 0:
-            rospy.loginfo("Resetting the fp node")
+            print(colored("Resetting the fp node", "green"))
             self.is_object_registered = False
         else:
-            rospy.loginfo("Received a reset message with data <= 0")
+            print(colored("Received a reset message with data <= 0", "green"))
 
     def run(self):
         ##############################
@@ -167,9 +166,7 @@ class FoundationPoseROS:
             or self.latest_mask is None
             or self.latest_cam_K is None
         ):
-            rospy.loginfo(
-                "Missing one of the required images (RGB, depth, mask, cam_K). Waiting..."
-            )
+            print(colored("Missing one of the required images (RGB, depth, mask, cam_K). Waiting...", "yellow"))
             rospy.sleep(0.1)
 
         assert self.latest_rgb is not None
@@ -182,7 +179,7 @@ class FoundationPoseROS:
                 ##############################
                 # Register
                 ##############################
-                rospy.loginfo("Running registration")
+                print(colored("Running registration", "green"))
 
                 register_rgb = self.process_rgb(self.latest_rgb)
                 register_depth = self.process_depth(self.latest_depth)
@@ -202,9 +199,9 @@ class FoundationPoseROS:
                         else self.est_refine_iter
                     ),
                 )
-                rospy.loginfo(f"time for reg mask is = {(time.time() - t0)*1000} ms")
+                print(colored(f"time for reg mask is = {(time.time() - t0)*1000} ms", "green"))
                 logging.info("Registration done")
-                rospy.loginfo(f"pose = {pose}")
+                print(colored(f"pose = {pose}", "green"))
                 assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
 
                 if self.debug >= 3:
@@ -216,7 +213,7 @@ class FoundationPoseROS:
                     pcd = toOpen3dCloud(xyz_map[valid], register_rgb[valid])
                     pcd_path = f"{self.debug_dir}/scene_complete.ply"
                     o3d.io.write_point_cloud(pcd_path, pcd)
-                    rospy.loginfo(f"Point cloud saved to {pcd_path}")
+                    print(colored(f"Point cloud saved to {pcd_path}", "green"))
 
                 self.is_object_registered = True
                 self.first = False
@@ -235,7 +232,7 @@ class FoundationPoseROS:
                 pose = self.FPModel.track_one(
                     rgb=rgb, depth=depth, K=cam_K, iteration=self.track_refine_iter
                 )
-                rospy.loginfo(f"time for track is = {(time.time() - t0)*1000} ms")
+                print(colored(f"time for track is = {(time.time() - t0)*1000} ms", "green"))
 
                 # Publish pose
                 self.publish_pose(pose)
@@ -263,12 +260,9 @@ class FoundationPoseROS:
                     cv2.waitKey(1)
 
                 done_time = rospy.Time.now()
-                rospy.loginfo(
-                    f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec()*1000)} ms)"
-                )
+                print(colored(f"Max rate: {np.round(1./(done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec()*1000)} ms)", "green"))
 
     def process_rgb(self, rgb):
-        rospy.logdebug(f"rgb: {rgb.shape}, {rgb.dtype}, {np.max(rgb)}, {np.min(rgb)}")
         return rgb
 
     def process_depth(self, depth):
@@ -281,10 +275,11 @@ class FoundationPoseROS:
         # If the max value is greater than 100, then it's likely in mm
         in_mm = depth.max() > 100
         if in_mm:
-            rospy.loginfo(f"Converting depth from mm to m since max = {depth.max()}")
+            # print(colored(f"Converting depth from mm to m since max = {depth.max()}", "green"))
             depth = depth / 1000
         else:
-            rospy.loginfo(f"Depth is in meters since max = {depth.max()}")
+            pass
+            # print(colored(f"Depth is in meters since max = {depth.max()}", "green"))
 
         # Clamp
         depth[depth < 0.1] = 0
@@ -294,9 +289,6 @@ class FoundationPoseROS:
 
     def process_mask(self, mask):
         mask = mask.astype(bool)
-        rospy.logdebug(
-            f"mask: {mask.shape}, {mask.dtype}, {np.max(mask)}, {np.min(mask)}"
-        )
         return mask
 
     def publish_pose(self, pose: np.ndarray):
@@ -313,7 +305,6 @@ class FoundationPoseROS:
 
         # Publish the pose
         self.pose_pub.publish(msg)
-        rospy.logdebug("Pose published to /object_pose")
 
 
 if __name__ == "__main__":
