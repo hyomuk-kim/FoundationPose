@@ -246,6 +246,8 @@ You can visualize debug signals /sam2_reset and /sam2_num_mask_pixels with:
 rqt_plot
 ```
 
+FoundationPose can lose the object and it struggles to recover without being reset. To do this manually, you can run `rostopic pub /fp_reset std_msgs/Int32 "data: 1"`.
+
 # ORIGINAL DOCUMENTATION
 
 This is the official implementation of our paper to be appeared in CVPR 2024 (Highlight)
