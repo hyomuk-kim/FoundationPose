@@ -95,8 +95,9 @@ if __name__ == "__main__":
             # Tracking can fail catastrophically, so we check if the pose is reasonable
             # We do this by comparing the predicted pose to the mask (assume mask is correct)
             # If the prediction is bad, we re-register the object
-            COMPARE_WITH_MASK = True
+            COMPARE_WITH_MASK = False
             if COMPARE_WITH_MASK:
+                IOU_THRESHOLD = 0.1
                 predicted_depth, predicted_mask = render_depth_and_mask_cache(
                     trimesh_obj=mesh,
                     T_C_O=pose,
@@ -104,7 +105,7 @@ if __name__ == "__main__":
                     image_width=color.shape[1],
                     image_height=color.shape[0],
                 )
-                iou, is_match = compare_masks(mask, predicted_mask, threshold=0.4)
+                iou, is_match = compare_masks(mask, predicted_mask, threshold=IOU_THRESHOLD)
                 if not is_match:
                     logging.info(f"mismatch! iou:{iou}")
                     mask = reader.get_mask(i).astype(bool)
