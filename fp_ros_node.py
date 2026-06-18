@@ -1,41 +1,46 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+FoundationPose ROS2 node.
+Subscribes to RGB-D camera images and SAM2 mask,
+runs FoundationPose estimation/tracking,
+and publishes the object pose as PoseStamped on /object_pose.
+"""
 
-import logging
 import os
 import time
 
 import cv2
 import numpy as np
 import nvdiffrast.torch as dr
-import open3d as o3d
-import rospy
+import rclpy
+from rclpy.node import Node
 import trimesh
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import PoseStamped
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
 from std_msgs.msg import Int32
-from termcolor import colored
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from fp_ros_utils import get_mesh_file
 from Utils import (
-    depth2xyzmap,
     draw_posed_3d_box,
     draw_xyz_axis,
     set_logging_format,
     set_seed,
-    toOpen3dCloud,
 )
 
 
-class FoundationPoseROS:
+class FoundationPoseROS2(Node):
+
     def __init__(self):
+        super().__init__("fp_node")
+
         set_logging_format()
         set_seed(0)
 
-        # Variables for storing the latest images
+        # State variables
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_cam_K = None
@@ -43,28 +48,37 @@ class FoundationPoseROS:
         self.is_object_registered = False
         self.first = True
 
-        self.first_est_refine_iter = 5  # Can be higher since we only run this once at the very first time to get a good initial pose
-        self.est_refine_iter = 1  # Want this as low as possible to run as fast as possible when re-initializing pose (roughly 1 second for each iter?)
-        self.track_refine_iter = 2  # Want this as low as possible to run as fast as possible for more accurate tracking (1 seems to be too low though)
+        # Refinement iterations
+        self.first_est_refine_iter = 5  # Higher quality for first registration
+        self.est_refine_iter = 1  # Fast re-init when reset triggered
+        self.track_refine_iter = 2  # Per-frame tracking
 
-        # Debugging
+        # FoundationPose library's internal debug level (passed to the model below).
+        # Only >= 2 does anything: it dumps point clouds / refiner-vis images to disk,
+        # which is slow. Keep at 0 for normal runs; bump manually when deep-debugging.
         code_dir = os.path.dirname(os.path.realpath(__file__))
-        self.debug = 0  # Keep debug level at 0 to avoid unnecessary overhead since we want this running as fast as possible
+        self.debug = 0
         self.debug_dir = f"{code_dir}/debug"
-        os.makedirs(self.debug_dir, exist_ok=True)
-        os.makedirs(f"{self.debug_dir}/track_vis", exist_ok=True)
-        os.makedirs(f"{self.debug_dir}/ob_in_cam", exist_ok=True)
 
-        rospy.init_node("fp_node")
+        # Our node's own real-time visualization (cv2 window). Separate from the
+        # library debug above. Toggle at launch with -p visualize:=true.
+        self.declare_parameter("visualize", True)
+        self.visualize = self.get_parameter(
+            "visualize").get_parameter_value().bool_value
+
+        # Processing lock to prevent overlapping timer calls
+        self.is_processing = False
+
         self.bridge = CvBridge()
 
         # Load object mesh
-        mesh_file = get_mesh_file()
+        mesh_file = get_mesh_file(self)
         self.object_mesh = trimesh.load(mesh_file)
-        self.to_origin, extents = trimesh.bounds.oriented_bounds(self.object_mesh)
+        self.to_origin, extents = trimesh.bounds.oriented_bounds(
+            self.object_mesh)
         self.bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
-        # FOUNDATION POSE initialization
+        # FoundationPose model init
         self.scorer = ScorePredictor()
         self.refiner = PoseRefinePredictor()
         self.glctx = dr.RasterizeCudaContext()
@@ -78,259 +92,199 @@ class FoundationPoseROS:
             debug=self.debug,
             glctx=self.glctx,
         )
-        print(colored("Estimator initialization done", "green"))
+        self.get_logger().info("FoundationPose model initialized")
 
-        # Check camera parameter
-        camera = rospy.get_param("/camera", None)
-        if camera is None:
-            DEFAULT_CAMERA = "zed"
-            print(
-                colored(
-                    f"No /camera parameter found, using default camera {DEFAULT_CAMERA}",
-                    "yellow",
-                )
-            )
-            camera = DEFAULT_CAMERA
-        print(colored(f"Using camera: {camera}", "green"))
+        # Camera topic selection via ROS2 parameter
+        self.declare_parameter("camera", "realsense")
+        camera = self.get_parameter("camera").get_parameter_value().string_value
+        self.get_logger().info(f"Using camera: {camera}")
+
         if camera == "zed":
-            self.rgb_sub_topic = "/zed/zed_node/rgb/image_rect_color"
-            self.depth_sub_topic = "/zed/zed_node/depth/depth_registered"
-            self.camera_info_sub_topic = "/zed/zed_node/rgb/camera_info"
+            rgb_topic = "/zed/zed_node/rgb/image_rect_color"
+            depth_topic = "/zed/zed_node/depth/depth_registered"
+            cam_info_topic = "/zed/zed_node/rgb/camera_info"
         elif camera == "realsense":
-            self.rgb_sub_topic = "/camera/color/image_raw"
-            self.depth_sub_topic = "/camera/aligned_depth_to_color/image_raw"
-            self.camera_info_sub_topic = "/camera/color/camera_info"
+            rgb_topic = "/camera/color/image_raw"
+            depth_topic = "/camera/aligned_depth_to_color/image_raw"
+            cam_info_topic = "/camera/color/camera_info"
         else:
             raise ValueError(f"Unknown camera: {camera}")
 
-        # Subscribers for RGB, depth, and mask images
-        self.rgb_sub = rospy.Subscriber(
-            self.rgb_sub_topic,
-            ROSImage,
-            self.rgb_callback,
-            queue_size=1,
-        )
-        self.depth_sub = rospy.Subscriber(
-            self.depth_sub_topic,
-            # "/depth_anything_v2/depth",
-            ROSImage,
-            self.depth_callback,
-            queue_size=1,
-        )
-        self.mask_sub = rospy.Subscriber(
-            "/sam2_mask", ROSImage, self.mask_callback, queue_size=1
-        )
-        self.cam_K_sub = rospy.Subscriber(
-            self.camera_info_sub_topic,
-            CameraInfo,
-            self.cam_K_callback,
-            queue_size=1,
-        )
-        self.reset_sub = rospy.Subscriber(
-            "/fp_reset", Int32, self.reset_callback, queue_size=1
-        )
+        # Subscribers
+        self.create_subscription(ROSImage, rgb_topic, self.rgb_callback, 1)
+        self.create_subscription(ROSImage, depth_topic, self.depth_callback, 1)
+        self.create_subscription(ROSImage, "/sam2_mask", self.mask_callback, 1)
+        self.create_subscription(CameraInfo, cam_info_topic,
+                                 self.cam_K_callback, 1)
+        self.create_subscription(Int32, "/fp_reset", self.reset_callback, 1)
 
-        # Publisher for the object pose
-        self.pose_pub = rospy.Publisher("/object_pose", Pose, queue_size=1)
+        # Publisher: PoseStamped instead of Pose (adds timestamp)
+        self.pose_pub = self.create_publisher(PoseStamped, "/object_pose", 1)
+
+        # Timer-driven main loop (runs as fast as GPU allows)
+        self.timer = self.create_timer(0.01, self.run_once)
+        self.get_logger().info("FoundationPose ROS2 node ready")
+
+    # ---------- callbacks ----------
 
     def rgb_callback(self, data):
         try:
             self.latest_rgb = self.bridge.imgmsg_to_cv2(data, "rgb8")
         except CvBridgeError as e:
-            print(colored(f"Could not convert RGB image: {e}", "red"))
+            self.get_logger().error(f"RGB conversion failed: {e}")
 
     def depth_callback(self, data):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(data, "64FC1")
         except CvBridgeError as e:
-            print(colored(f"Could not convert depth image: {e}", "red"))
+            self.get_logger().error(f"Depth conversion failed: {e}")
 
     def mask_callback(self, data):
         try:
             self.latest_mask = self.bridge.imgmsg_to_cv2(data, "mono8")
         except CvBridgeError as e:
-            print(colored(f"Could not convert mask image: {e}", "red"))
+            self.get_logger().error(f"Mask conversion failed: {e}")
 
     def cam_K_callback(self, data: CameraInfo):
-        self.latest_cam_K = np.array(data.K).reshape(3, 3)
+        self.latest_cam_K = np.array(data.k).reshape(3, 3)
 
-    def reset_callback(self, data):
+    def reset_callback(self, data: Int32):
         if data.data > 0:
-            print(colored("Resetting the fp node", "green"))
+            self.get_logger().info("Reset triggered — re-registering object")
             self.is_object_registered = False
         else:
-            print(colored("Received a reset message with data <= 0", "green"))
+            self.get_logger().info(
+                "Reset message received with data <= 0, ignoring")
 
-    def run(self):
-        ##############################
-        # Wait for the first images
-        ##############################
-        while not rospy.is_shutdown() and (
-            self.latest_rgb is None
-            or self.latest_depth is None
-            or self.latest_mask is None
-            or self.latest_cam_K is None
-        ):
-            print(
-                colored(
-                    "Missing one of the required images (RGB, depth, mask, cam_K). Waiting...",
-                    "yellow",
-                )
-            )
-            rospy.sleep(0.1)
+    # ---------- main loop ----------
 
-        assert self.latest_rgb is not None
-        assert self.latest_depth is not None
-        assert self.latest_mask is not None
-        assert self.latest_cam_K is not None
+    def run_once(self):
+        """Called by timer. Runs one registration or tracking step."""
+        if self.is_processing:
+            return
 
-        while not rospy.is_shutdown():
+        if any(x is None for x in [
+                self.latest_rgb, self.latest_depth, self.latest_mask,
+                self.latest_cam_K
+        ]):
+            self.get_logger().warn(
+                "Waiting for RGB, depth, mask, and camera_info...",
+                throttle_duration_sec=2.0)
+            return
+
+        self.is_processing = True
+        try:
             if not self.is_object_registered:
-                ##############################
-                # Register
-                ##############################
-                print(colored("Running registration", "green"))
-
-                register_rgb = self.process_rgb(self.latest_rgb)
-                register_depth = self.process_depth(self.latest_depth)
-                register_mask = self.process_mask(self.latest_mask)
-                register_cam_K = self.latest_cam_K.copy()
-
-                # Estimation and tracking
-                t0 = time.time()
-                pose = self.FPModel.register(
-                    K=register_cam_K,
-                    rgb=register_rgb,
-                    depth=register_depth,
-                    ob_mask=register_mask,
-                    iteration=(
-                        self.first_est_refine_iter
-                        if self.first
-                        else self.est_refine_iter
-                    ),
-                )
-                print(
-                    colored(
-                        f"time for reg mask is = {(time.time() - t0) * 1000} ms",
-                        "green",
-                    )
-                )
-                print(colored("Registration done", "green"))
-                print(colored(f"pose = {pose}", "green"))
-                assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
-
-                if self.debug >= 3:
-                    m = self.object_mesh.copy()
-                    m.apply_transform(pose)
-                    m.export(f"{self.debug_dir}/model_tf.obj")
-                    xyz_map = depth2xyzmap(register_depth, register_cam_K)
-                    valid = register_depth >= 0.001
-                    pcd = toOpen3dCloud(xyz_map[valid], register_rgb[valid])
-                    pcd_path = f"{self.debug_dir}/scene_complete.ply"
-                    o3d.io.write_point_cloud(pcd_path, pcd)
-                    print(colored(f"Point cloud saved to {pcd_path}", "green"))
-
-                self.is_object_registered = True
-                self.first = False
+                self._register()
             else:
-                ##############################
-                # Track
-                ##############################
-                start_time = rospy.Time.now()
+                self._track()
+        finally:
+            self.is_processing = False
 
-                rgb = self.process_rgb(self.latest_rgb)
-                depth = self.process_depth(self.latest_depth)
-                _mask = self.process_mask(self.latest_mask)
-                cam_K = self.latest_cam_K.copy()
+    def _register(self):
+        """Initial pose estimation using SAM2 mask."""
+        self.get_logger().info("Running registration...")
+        rgb = self.process_rgb(self.latest_rgb)
+        depth = self.process_depth(self.latest_depth)
+        mask = self.process_mask(self.latest_mask)
+        cam_K = self.latest_cam_K.copy()
 
-                t0 = time.time()
-                pose = self.FPModel.track_one(
-                    rgb=rgb, depth=depth, K=cam_K, iteration=self.track_refine_iter
-                )
-                print(
-                    colored(
-                        f"time for track is = {(time.time() - t0) * 1000} ms", "green"
-                    )
-                )
+        t0 = time.time()
+        pose = self.FPModel.register(
+            K=cam_K,
+            rgb=rgb,
+            depth=depth,
+            ob_mask=mask,
+            iteration=self.first_est_refine_iter
+            if self.first else self.est_refine_iter,
+        )
+        elapsed_ms = (time.time() - t0) * 1000
+        self.get_logger().info(
+            f"Registration done in {elapsed_ms:.1f} ms, pose:\n{pose}")
+        assert pose.shape == (4, 4), f"Unexpected pose shape: {pose.shape}"
+        self.is_object_registered = True
+        self.first = False
 
-                # Publish pose
-                self.publish_pose(pose)
+    def _track(self):
+        """Frame-to-frame tracking."""
+        rgb = self.process_rgb(self.latest_rgb)
+        depth = self.process_depth(self.latest_depth)
+        cam_K = self.latest_cam_K.copy()
 
-                if self.debug >= 1:
-                    center_pose = pose @ np.linalg.inv(self.to_origin)
+        t0 = time.time()
+        pose = self.FPModel.track_one(rgb=rgb,
+                                      depth=depth,
+                                      K=cam_K,
+                                      iteration=self.track_refine_iter)
+        elapsed_ms = (time.time() - t0) * 1000
+        self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
 
-                    # Must be BGR for cv2
-                    vis_img = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
+        self.publish_pose(pose)
 
-                    vis_img = draw_posed_3d_box(
-                        cam_K, img=vis_img, ob_in_cam=center_pose, bbox=self.bbox
-                    )
-                    vis_img = draw_xyz_axis(
-                        vis_img,
-                        ob_in_cam=center_pose,
-                        scale=0.1,
-                        K=cam_K,
-                        thickness=3,
-                        transparency=0,
-                        is_input_rgb=True,
-                    )
+        if self.visualize:
+            center_pose = pose @ np.linalg.inv(self.to_origin)
+            vis_img = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
+            vis_img = draw_posed_3d_box(cam_K,
+                                        img=vis_img,
+                                        ob_in_cam=center_pose,
+                                        bbox=self.bbox)
+            vis_img = draw_xyz_axis(vis_img,
+                                    ob_in_cam=center_pose,
+                                    scale=0.1,
+                                    K=cam_K,
+                                    thickness=3,
+                                    transparency=0,
+                                    is_input_rgb=True)
+            cv2.imshow("Pose Visualization", vis_img)
+            cv2.waitKey(1)
 
-                    cv2.imshow("Pose Visualization", vis_img)
-                    cv2.waitKey(1)
+    # ---------- helpers ----------
 
-                done_time = rospy.Time.now()
-                print(
-                    colored(
-                        f"Max rate: {np.round(1.0 / (done_time - start_time).to_sec())} Hz ({np.round((done_time - start_time).to_sec() * 1000)} ms)",
-                        "green",
-                    )
-                )
+    def publish_pose(self, pose: np.ndarray):
+        assert pose.shape == (4, 4), f"Unexpected pose shape: {pose.shape}"
+        trans = pose[:3, 3]
+        quat_xyzw = R.from_matrix(pose[:3, :3]).as_quat()
+
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "camera_color_optical_frame"  # adjust if needed
+        msg.pose.position.x = float(trans[0])
+        msg.pose.position.y = float(trans[1])
+        msg.pose.position.z = float(trans[2])
+        msg.pose.orientation.x = float(quat_xyzw[0])
+        msg.pose.orientation.y = float(quat_xyzw[1])
+        msg.pose.orientation.z = float(quat_xyzw[2])
+        msg.pose.orientation.w = float(quat_xyzw[3])
+        self.pose_pub.publish(msg)
 
     def process_rgb(self, rgb):
         return rgb
 
     def process_depth(self, depth):
-        # Turn nan values into 0
+        depth = depth.copy()
         depth[np.isnan(depth)] = 0
         depth[np.isinf(depth)] = 0
-
-        # depth is either in meters or millimeters
-        # Need to convert to meters
-        # If the max value is greater than 100, then it's likely in mm
-        in_mm = depth.max() > 100
-        if in_mm:
-            # print(colored(f"Converting depth from mm to m since max = {depth.max()}", "green"))
-            depth = depth / 1000
-        else:
-            pass
-            # print(colored(f"Depth is in meters since max = {depth.max()}", "green"))
-
-        # Clamp
+        if depth.max() > 100:  # mm → m
+            depth = depth / 1000.0
         depth[depth < 0.1] = 0
-        depth[depth > 4] = 0
-
+        depth[depth > 4.0] = 0
         return depth
 
     def process_mask(self, mask):
-        mask = mask.astype(bool)
-        return mask
+        return mask.astype(bool)
 
-    def publish_pose(self, pose: np.ndarray):
-        assert pose.shape == (4, 4), f"pose.shape = {pose.shape}"
-        trans = pose[:3, 3]
-        quat_xyzw = R.from_matrix(pose[:3, :3]).as_quat()
 
-        # Convert the pose matrix into a ROS message
-        msg = Pose()
-        msg.position.x, msg.position.y, msg.position.z = trans
-        msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = (
-            quat_xyzw
-        )
-
-        # Publish the pose
-        self.pose_pub.publish(msg)
+def main(args=None):
+    rclpy.init(args=args)
+    node = FoundationPoseROS2()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
-    node = FoundationPoseROS()
-    node.run()
+    main()
