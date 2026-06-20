@@ -1,0 +1,18 @@
+# ROS2 (Humble) + SAM2 unified image for FoundationPose integration.
+# Builds on the base `foundationpose` image.
+FROM foundationpose
+
+# Install ROS2 Humble + cv_bridge via RoboStack
+RUN conda run -n my conda config --env --add channels conda-forge \
+  && conda run -n my conda config --env --add channels robostack-humble \
+  && conda run -n my conda config --env --remove channels defaults || true \
+  && conda run -n my conda install -y ros-humble-desktop ros-humble-cv-bridge
+
+# Clone SAM2 real-time repo (ros2-port branch) and install
+RUN git clone --branch ros2-port \
+    https://github.com/hyomuk-kim/segment-anything-2-real-time.git \
+    /opt/sam2
+RUN conda run -n my pip install -e /opt/sam2
+
+# Download SAM2 checkpoints (wget is available on Ubuntu)
+RUN cd /opt/sam2/checkpoints && bash download_ckpts.sh
