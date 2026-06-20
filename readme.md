@@ -1,11 +1,40 @@
 # FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects
 [[Paper]](https://arxiv.org/abs/2312.08344) [[Website]](https://nvlabs.github.io/FoundationPose/)
 
-# TYLER DOCUMENTATION (September 8, 2024)
+## ROS2 Port (by Hyomuk Kim)
+
+This fork ports the ROS nodes from ROS1 (rospy) to ROS2 (rclpy),
+for integration with the Object-Informed MPPI pipeline (ROS2-based).
+
+### What changed
+- `fp_ros_node.py`, `fp_evaluator_ros_node.py`, `fp_ros_utils.py`:
+  ported from rospy to rclpy. Pose is now published as `PoseStamped`
+  (was `Pose`) on `/object_pose`, adding a timestamp.
+- Parameters are passed via ROS2 args, e.g.
+  `--ros-args -p camera:=realsense -p mesh_file:=/path/to/mesh.obj`
+- `visualize` is now a ROS2 parameter (default true) instead of a
+  hardcoded debug level.
+- Evaluator: added an optional depth-based check (`use_depth_check`,
+  default false) on top of mask IoU, to catch z-axis pose errors that
+  the 2D silhouette misses.
+
+### Run (ROS2)
+```bash
+# 1. RealSense driver
+ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
+# 2. SAM2 (separate repo, also ported to ROS2)
+python3 sam2_ros_node.py --ros-args -p camera:=realsense
+# 3. FoundationPose
+python3 fp_ros_node.py --ros-args -p camera:=realsense -p mesh_file:=/path/to/mesh.obj
+# 4. Evaluator (watchdog)
+python3 fp_evaluator_ros_node.py --ros-args -p camera:=realsense -p mesh_file:=/path/to/mesh.obj
+```
+
+## TYLER DOCUMENTATION (September 8, 2024)
 
 NOTE: The purpose of this documentation is NOT to be super precise and detailed, but rather to be a quick reference for how to run the code and how it works.
 
-## EXAMPLE VIDEO
+### EXAMPLE VIDEO
 
 This is an example that demonstrates the reasonable robustness FoundationPose, with the help of the Segment Anything Model 2 (SAM2) model to initialize FoundationPose and reset FoundationPose when the object is lost. If the SAM2 mask (very accurate) is very different from the FoundationPose prediction's mask (less accurate), the tracker will reset.
 
@@ -13,9 +42,9 @@ This video shows FoundationPose working at ~40Hz.
 
 [2024-09-08_SAM2_FP_Robust_compressed.webm](https://github.com/user-attachments/assets/892a984a-571d-4451-bf69-15415800981c)
 
-## INPUTS AND OUTPUTS
+### INPUTS AND OUTPUTS
 
-### FP ROS NODE
+#### FP ROS NODE
 
 ```mermaid
 flowchart LR
@@ -45,7 +74,7 @@ flowchart LR
 * `fp_reset` is a boolean trigger to reset the pose estimation model
 * `object_pose` is the estimated 6D pose of the detected object (in camera frame)
 
-### FP EVALUATOR ROS NODE
+#### FP EVALUATOR ROS NODE
 
 ```mermaid
 flowchart LR
@@ -96,7 +125,7 @@ elif camera == "realsense":
     self.camera_info_sub_topic = "/camera/color/camera_info"
 ```
 
-## CHANGES
+### CHANGES
 
 * Addition of `docker/ros_dockerfile` and `docker/run_ros_container.sh` to add ROS Noetic installation with Robostack (https://robostack.github.io/GettingStarted.html)
 
