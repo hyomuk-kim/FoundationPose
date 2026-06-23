@@ -74,6 +74,7 @@ class FoundationPoseROS2(Node):
         # Load object mesh
         mesh_file = get_mesh_file(self)
         self.object_mesh = trimesh.load(mesh_file)
+        self.object_mesh.vertices *= 0.001  # Convert mesh from mm to meters
         self.to_origin, extents = trimesh.bounds.oriented_bounds(
             self.object_mesh)
         self.bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)

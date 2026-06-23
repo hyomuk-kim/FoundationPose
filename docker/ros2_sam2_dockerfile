@@ -1,18 +1,99 @@
-# ROS2 (Humble) + SAM2 unified image for FoundationPose integration.
+# =============================================================================
+# ROS2 (Humble) + SAM2 + FoundationPose unified image
 # Builds on the base `foundationpose` image.
+#
+# This Dockerfile bakes in every fix that was validated by hand during the
+# 2026-06-22 lab bring-up session, so a clean `docker build` reproduces the
+# working pipeline without manual patching.
+#
+# Architecture:
+#   - conda env `my`   (Python 3.9)  -> FoundationPose inference + rclpy
+#   - conda env `ros2` (Python 3.11) -> ROS2 Humble + RealSense + SAM2
+# Nodes talk over ROS2 topics, so the Python-version split across envs is fine.
+# =============================================================================
 FROM foundationpose
 
-# Install ROS2 Humble + cv_bridge via RoboStack
+# -----------------------------------------------------------------------------
+# 1) ROS2 env (Python 3.11). Humble's RoboStack packages now require >= 3.11,
+#    which conflicts with FoundationPose's Python 3.9 `my` env, hence a separate
+#    env instead of installing ROS2 into `my`.
+# -----------------------------------------------------------------------------
+RUN conda create -n ros2 python=3.11 -y
+
+# ROS2 Humble desktop + cv_bridge + RealSense driver via RoboStack.
+# `|| true` on the remove: Miniforge has no `defaults` channel, so the remove
+# is a harmless no-op that must not abort the build.
+RUN conda run -n ros2 conda config --env --add channels conda-forge \
+  && conda run -n ros2 conda config --env --add channels robostack-humble \
+  && conda run -n ros2 conda config --env --remove channels defaults || true \
+  && conda run -n ros2 conda install -y \
+       ros-humble-desktop \
+       ros-humble-cv-bridge \
+       ros-humble-realsense2-camera
+
+# -----------------------------------------------------------------------------
+# 2) SAM2 (real-time fork). Clone first, then pin torch BEFORE building so the
+#    CUDA extension compiles against CUDA 12.1 (matching the base image) instead
+#    of pip pulling a CUDA-13 torch wheel.
+# -----------------------------------------------------------------------------
+RUN git clone --branch main \
+    https://github.com/hyomuk-kim/segment-anything-2-real-time.git \
+    /opt/sam2
+
+# numpy<2 first (numpy 2.x conflicts with this torch), then torch cu121.
+RUN conda run -n ros2 pip install "numpy<2"
+RUN conda run -n ros2 pip install \
+    torch==2.5.1+cu121 torchvision==0.20.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# SAM2 runtime deps (no torch here; it is already pinned above).
+RUN conda run -n ros2 pip install --no-build-isolation \
+    hydra-core iopath tqdm pillow
+
+# Register SAM2 on the path without a full `pip install -e .` (which would try to
+# re-resolve torch). The package import works via this .pth entry.
+RUN echo "/opt/sam2" \
+    > /opt/conda/envs/ros2/lib/python3.11/site-packages/sam2.pth
+
+# Build the sam2._C CUDA extension (connected_components) for arch 8.9 (RTX 4080
+# Ada). With _C present, fill_hole_area works normally and no source workaround
+# is needed.
+RUN cd /opt/sam2 \
+    && TORCH_CUDA_ARCH_LIST="8.9" conda run -n ros2 \
+       python setup.py build_ext --inplace
+
+# _C.so links against libc10.so / libtorch in the torch lib dir. Add that dir to
+# LD_LIBRARY_PATH whenever the ros2 env is activated (scoped to this env only).
+RUN mkdir -p /opt/conda/envs/ros2/etc/conda/activate.d \
+    && echo 'export LD_LIBRARY_PATH=/opt/conda/envs/ros2/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH' \
+       > /opt/conda/envs/ros2/etc/conda/activate.d/torch_lib.sh
+
+# SAM2 checkpoints.
+RUN cd /opt/sam2/checkpoints && bash download_ckpts.sh
+
+# -----------------------------------------------------------------------------
+# 3) FoundationPose `my` env (Python 3.9): add rclpy + cv_bridge so fp_ros_node
+#    can run as a ROS2 node. RoboStack's rclpy pulls in numpy 2.x / new opencv,
+#    which breaks FoundationPose's deps, so we pin them back immediately after.
+# -----------------------------------------------------------------------------
 RUN conda run -n my conda config --env --add channels conda-forge \
   && conda run -n my conda config --env --add channels robostack-humble \
   && conda run -n my conda config --env --remove channels defaults || true \
-  && conda run -n my conda install -y ros-humble-desktop ros-humble-cv-bridge
+  && conda run -n my conda install -y \
+       ros-humble-rclpy \
+       ros-humble-cv-bridge
 
-# Clone SAM2 real-time repo (ros2-port branch) and install
-RUN git clone --branch ros2-port \
-    https://github.com/hyomuk-kim/segment-anything-2-real-time.git \
-    /opt/sam2
-RUN conda run -n my pip install -e /opt/sam2
+# Pin the versions verified to work with FoundationPose (numpy 1.x toolchain).
+# opencv 4.10 is the last line that does NOT force numpy>=2.
+RUN conda run -n my pip install \
+    "numpy==1.26.4" "scipy==1.11.4" "trimesh==3.23.5" \
+    "opencv-python==4.10.0.84" "opencv-contrib-python==4.10.0.84" \
+    --force-reinstall --no-deps
 
-# Download SAM2 checkpoints (wget is available on Ubuntu)
-RUN cd /opt/sam2/checkpoints && bash download_ckpts.sh
+# -----------------------------------------------------------------------------
+# 4) Cleanup (safe size reduction only; does not touch the working set).
+# -----------------------------------------------------------------------------
+RUN conda clean -afy \
+    && conda run -n ros2 pip cache purge || true \
+    && conda run -n my pip cache purge || true \
+    && rm -rf /root/.cache/pip
