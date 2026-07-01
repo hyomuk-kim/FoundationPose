@@ -65,6 +65,7 @@ class FoundationPoseROS2(Node):
         self.declare_parameter("visualize", True)
         self.visualize = self.get_parameter(
             "visualize").get_parameter_value().bool_value
+        self.latest_vis_img = None
 
         # Processing lock to prevent overlapping timer calls
         self.is_processing = False
@@ -107,6 +108,7 @@ class FoundationPoseROS2(Node):
         elif camera == "realsense":
             rgb_topic = "/camera/color/image_raw"
             depth_topic = "/camera/aligned_depth_to_color/image_raw"
+            # depth_topic = "/camera/depth/image_rect_raw"
             cam_info_topic = "/camera/color/camera_info"
         else:
             raise ValueError(f"Unknown camera: {camera}")
@@ -236,8 +238,9 @@ class FoundationPoseROS2(Node):
                                     thickness=3,
                                     transparency=0,
                                     is_input_rgb=True)
-            cv2.imshow("Pose Visualization", vis_img)
-            cv2.waitKey(1)
+            # cv2.imshow("Pose Visualization", vis_img)
+            # cv2.waitKey(1)
+            self.latest_vis_img = vis_img
 
     # ---------- helpers ----------
 
@@ -276,15 +279,27 @@ class FoundationPoseROS2(Node):
 
 
 def main(args=None):
+    import threading
     rclpy.init(args=args)
     node = FoundationPoseROS2()
+
+    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
+
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            if node.visualize and node.latest_vis_img is not None:
+                cv2.imshow("Pose Visualization", node.latest_vis_img)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
+        spin_thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":
