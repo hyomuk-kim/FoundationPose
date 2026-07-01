@@ -51,15 +51,21 @@ class FoundationPoseROS2(Node):
 
         # Constant-velocity SE(3) prior: seed each track step with an
         # extrapolation of the last two poses (pose_last is ob_in_cam).
-        self.use_cv_prior = False
+        self.use_cv_prior = True
         self.pose_last_prev = None
         self.max_translation_step = 0.1  # reject >10cm/frame jumps as glitches
 
         # Mask-gated tracking: zero depth outside the SAM2 mask before tracking.
-        self.use_mask_gating = False
+        self.use_mask_gating = True
         self.mask_gating_min_pixels = 100  # below this, mask is empty -> skip gating
         self.mask_gating_dilate_px = 15  # grow mask to absorb mask/object lag
         self.mask_gating_max_staleness_sec = 1.2  # skip gating if mask older (SAM2 ~1Hz)
+
+        # Auto-reset parameters for spatial drift detection
+        self.use_auto_reset = True
+        self.auto_reset_patience = 3       # Consecutive frames required to trigger reset
+        self.drift_counter = 0
+        self.max_center_dist_px = 30.0     # Max pixel distance between SAM2 and FP centers
 
         # Refinement iterations
         self.first_est_refine_iter = 5  # Higher quality for first registration
@@ -241,6 +247,9 @@ class FoundationPoseROS2(Node):
         elapsed_ms = (time.time() - t0) * 1000
         self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
 
+        if self.check_auto_reset(pose, cam_K):
+            return  # Abort publishing this frame and re-register next frame
+
         self.update_cv_prior_history()
         self.publish_pose(pose)
 
@@ -378,6 +387,53 @@ class FoundationPoseROS2(Node):
         if pose_last is None:
             return
         self.pose_last_prev = pose_last.detach().cpu().numpy().reshape(4, 4)
+
+    # ---------- auto-reset with centroid distance ----------
+
+    def check_auto_reset(self, pose: np.ndarray, cam_K: np.ndarray) -> bool:
+        """
+        Detects spatial drift by comparing the SAM2 mask centroid with the
+        2D projection of the FoundationPose 3D center. Triggers a reset if lost.
+        Returns True if a reset was triggered, False otherwise.
+        """
+        if not self.use_auto_reset or self.latest_mask is None:
+            return False
+
+        mask_bool = self.latest_mask > 0
+        if int(mask_bool.sum()) < self.mask_gating_min_pixels:
+            return False
+
+        # Compute the 2D centroid of the SAM2 mask
+        ys, xs = np.nonzero(mask_bool)
+        mask_u, mask_v = float(np.mean(xs)), float(np.mean(ys))
+
+        # Project the FoundationPose 3D center to 2D image space
+        t = pose[:3, 3]
+        if t[2] <= 0.01:  # Prevent division by zero if behind the camera
+            return False
+
+        fp_u = (cam_K[0, 0] * t[0] / t[2]) + cam_K[0, 2]
+        fp_v = (cam_K[1, 1] * t[1] / t[2]) + cam_K[1, 2]
+
+        # Calculate Euclidean pixel distance
+        dist = np.linalg.norm([mask_u - fp_u, mask_v - fp_v])
+
+        # Update drift counter
+        if dist > self.max_center_dist_px:
+            self.drift_counter += 1
+        else:
+            self.drift_counter = max(0, self.drift_counter - 1)
+
+        # Trigger reset if patience is exceeded
+        if self.drift_counter >= self.auto_reset_patience:
+            self.get_logger().warn(
+                f"Tracking lost (Center dist: {dist:.1f}px). Auto-reset triggered."
+            )
+            self.is_object_registered = False
+            self.drift_counter = 0
+            return True
+
+        return False
 
 
 def main(args=None):
