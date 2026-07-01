@@ -8,19 +8,19 @@ and publishes the object pose as PoseStamped on /object_pose.
 
 import os
 import time
-
-import cv2
 import numpy as np
+import cv2
 import nvdiffrast.torch as dr
 import rclpy
-from rclpy.node import Node
 import trimesh
+
 from cv_bridge import CvBridge, CvBridgeError
+from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from scipy.spatial.transform import Rotation as R
+from std_msgs.msg import Int32
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image as ROSImage
-from std_msgs.msg import Int32
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from fp_ros_utils import get_mesh_file
@@ -45,8 +45,21 @@ class FoundationPoseROS2(Node):
         self.latest_depth = None
         self.latest_cam_K = None
         self.latest_mask = None
+        self.latest_mask_stamp = None  # arrival time of latest mask (staleness)
         self.is_object_registered = False
         self.first = True
+
+        # Constant-velocity SE(3) prior: seed each track step with an
+        # extrapolation of the last two poses (pose_last is ob_in_cam).
+        self.use_cv_prior = False
+        self.pose_last_prev = None
+        self.max_translation_step = 0.1  # reject >10cm/frame jumps as glitches
+
+        # Mask-gated tracking: zero depth outside the SAM2 mask before tracking.
+        self.use_mask_gating = False
+        self.mask_gating_min_pixels = 100  # below this, mask is empty -> skip gating
+        self.mask_gating_dilate_px = 15  # grow mask to absorb mask/object lag
+        self.mask_gating_max_staleness_sec = 1.2  # skip gating if mask older (SAM2 ~1Hz)
 
         # Refinement iterations
         self.first_est_refine_iter = 5  # Higher quality for first registration
@@ -145,6 +158,7 @@ class FoundationPoseROS2(Node):
     def mask_callback(self, data):
         try:
             self.latest_mask = self.bridge.imgmsg_to_cv2(data, "mono8")
+            self.latest_mask_stamp = self.get_clock().now()
         except CvBridgeError as e:
             self.get_logger().error(f"Mask conversion failed: {e}")
 
@@ -207,12 +221,17 @@ class FoundationPoseROS2(Node):
         assert pose.shape == (4, 4), f"Unexpected pose shape: {pose.shape}"
         self.is_object_registered = True
         self.first = False
+        self.pose_last_prev = None  # reset CV-prior history after re-registration
 
     def _track(self):
         """Frame-to-frame tracking."""
         rgb = self.process_rgb(self.latest_rgb)
         depth = self.process_depth(self.latest_depth)
         cam_K = self.latest_cam_K.copy()
+
+        # Mask-gate depth + apply constant-velocity prior before tracking.
+        depth = self.gate_depth_by_mask(depth)
+        self.apply_cv_prior()
 
         t0 = time.time()
         pose = self.FPModel.track_one(rgb=rgb,
@@ -222,6 +241,7 @@ class FoundationPoseROS2(Node):
         elapsed_ms = (time.time() - t0) * 1000
         self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
 
+        self.update_cv_prior_history()
         self.publish_pose(pose)
 
         if self.visualize:
@@ -276,6 +296,88 @@ class FoundationPoseROS2(Node):
 
     def process_mask(self, mask):
         return mask.astype(bool)
+
+    def gate_depth_by_mask(self, depth):
+        """Zero depth outside the dilated SAM2 mask. Falls back to ungated depth
+        if the mask is missing, empty, stale, or shape-mismatched."""
+        # missing
+        if not self.use_mask_gating or self.latest_mask is None:
+            return depth
+
+        # stale
+        if self.latest_mask_stamp is not None:
+            staleness = (self.get_clock().now() -
+                         self.latest_mask_stamp).nanoseconds * 1e-9
+            if staleness > self.mask_gating_max_staleness_sec:
+                self.get_logger().warn(
+                    f"Mask stale ({staleness * 1000:.0f} ms) — skipping gating",
+                    throttle_duration_sec=2.0)
+                return depth
+
+        # shape-mismatched
+        mask = self.latest_mask
+        if mask.shape != depth.shape:
+            self.get_logger().warn(
+                f"Mask shape {mask.shape} != depth {depth.shape} — skipping gating",
+                throttle_duration_sec=2.0)
+            return depth
+
+        # empty
+        mask_bool = mask > 0
+        if int(mask_bool.sum()) < self.mask_gating_min_pixels:
+            self.get_logger().warn("Mask near-empty — skipping gating",
+                                   throttle_duration_sec=2.0)
+            return depth
+
+        if self.mask_gating_dilate_px > 0:
+            k = 2 * self.mask_gating_dilate_px + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            mask_bool = cv2.dilate(mask_bool.astype(np.uint8), kernel) > 0
+
+        gated = depth.copy()
+        gated[~mask_bool] = 0
+        return gated
+
+    # ---------- constant-velocity prior ----------
+
+    def apply_cv_prior(self):
+        """Seed FoundationPose.pose_last with a constant-velocity SE(3)
+        extrapolation of the last two poses (ob_in_cam, so pred = delta @ curr)."""
+        if not self.use_cv_prior:
+            return
+
+        pose_last = self.FPModel.pose_last
+        if pose_last is None or self.pose_last_prev is None:
+            return
+
+        prev = self.pose_last_prev
+        curr = pose_last.detach().cpu().numpy().reshape(4, 4)
+        delta = curr @ np.linalg.inv(prev)
+        pred = delta @ curr
+
+        translation_step = np.linalg.norm(pred[:3, 3] - curr[:3, 3])
+        if translation_step > self.max_translation_step:
+            self.get_logger().warn(
+                f"CV prior jump {translation_step*100:.1f} cm too large — skipping",
+                throttle_duration_sec=2.0)
+            return
+
+        # Re-orthonormalize rotation against numerical drift.
+        u, _, vt = np.linalg.svd(pred[:3, :3])
+        pred[:3, :3] = u @ vt
+
+        import torch
+        self.FPModel.pose_last = torch.as_tensor(pred,
+                                                 dtype=pose_last.dtype,
+                                                 device=pose_last.device)
+
+    def update_cv_prior_history(self):
+        if not self.use_cv_prior:
+            return
+        pose_last = self.FPModel.pose_last
+        if pose_last is None:
+            return
+        self.pose_last_prev = pose_last.detach().cpu().numpy().reshape(4, 4)
 
 
 def main(args=None):
