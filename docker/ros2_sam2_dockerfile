@@ -1,99 +1,149 @@
 # =============================================================================
-# ROS2 (Humble) + SAM2 + FoundationPose unified image
-# Builds on the base `foundationpose` image.
+# ROS2 (Humble) + SAM2 + librealsense unified image
+# Builds on the base `foundationpose` image (Python 3.11 single env).
 #
-# This Dockerfile bakes in every fix that was validated by hand during the
-# 2026-06-22 lab bring-up session, so a clean `docker build` reproduces the
-# working pipeline without manual patching.
+# Single conda env `my` (Python 3.11) contains everything:
+#   - FoundationPose inference (torch, pytorch3d, nvdiffrast, ...)
+#   - ROS2 Humble (rclpy, cv_bridge, realsense2_camera via RoboStack)
+#   - SAM2 real-time
 #
-# Architecture:
-#   - conda env `my`   (Python 3.9)  -> FoundationPose inference + rclpy
-#   - conda env `ros2` (Python 3.11) -> ROS2 Humble + RealSense + SAM2
-# Nodes talk over ROS2 topics, so the Python-version split across envs is fine.
+# Eliminates the dual-env split that caused PYTHONPATH contamination,
+# numpy version conflicts, and per-terminal env switching overhead.
 # =============================================================================
 FROM foundationpose
 
 # -----------------------------------------------------------------------------
-# 1) ROS2 env (Python 3.11). Humble's RoboStack packages now require >= 3.11,
-#    which conflicts with FoundationPose's Python 3.9 `my` env, hence a separate
-#    env instead of installing ROS2 into `my`.
-# -----------------------------------------------------------------------------
-RUN conda create -n ros2 python=3.11 -y
-
-# ROS2 Humble desktop + cv_bridge + RealSense driver via RoboStack.
-# `|| true` on the remove: Miniforge has no `defaults` channel, so the remove
-# is a harmless no-op that must not abort the build.
-RUN conda run -n ros2 conda config --env --add channels conda-forge \
-  && conda run -n ros2 conda config --env --add channels robostack-humble \
-  && conda run -n ros2 conda config --env --remove channels defaults || true \
-  && conda run -n ros2 conda install -y \
-       ros-humble-desktop \
-       ros-humble-cv-bridge \
-       ros-humble-realsense2-camera
-
-# -----------------------------------------------------------------------------
-# 2) SAM2 (real-time fork). Clone first, then pin torch BEFORE building so the
-#    CUDA extension compiles against CUDA 12.1 (matching the base image) instead
-#    of pip pulling a CUDA-13 torch wheel.
-# -----------------------------------------------------------------------------
-RUN git clone --branch main \
-    https://github.com/hyomuk-kim/segment-anything-2-real-time.git \
-    /opt/sam2
-
-# numpy<2 first (numpy 2.x conflicts with this torch), then torch cu121.
-RUN conda run -n ros2 pip install "numpy<2"
-RUN conda run -n ros2 pip install \
-    torch==2.5.1+cu121 torchvision==0.20.1+cu121 \
-    --index-url https://download.pytorch.org/whl/cu121
-
-# SAM2 runtime deps (no torch here; it is already pinned above).
-RUN conda run -n ros2 pip install --no-build-isolation \
-    hydra-core iopath tqdm pillow
-
-# Register SAM2 on the path without a full `pip install -e .` (which would try to
-# re-resolve torch). The package import works via this .pth entry.
-RUN echo "/opt/sam2" \
-    > /opt/conda/envs/ros2/lib/python3.11/site-packages/sam2.pth
-
-# Build the sam2._C CUDA extension (connected_components) for arch 8.9 (RTX 4080
-# Ada). With _C present, fill_hole_area works normally and no source workaround
-# is needed.
-RUN cd /opt/sam2 \
-    && TORCH_CUDA_ARCH_LIST="8.9" conda run -n ros2 \
-       python setup.py build_ext --inplace
-
-# _C.so links against libc10.so / libtorch in the torch lib dir. Add that dir to
-# LD_LIBRARY_PATH whenever the ros2 env is activated (scoped to this env only).
-RUN mkdir -p /opt/conda/envs/ros2/etc/conda/activate.d \
-    && echo 'export LD_LIBRARY_PATH=/opt/conda/envs/ros2/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH' \
-       > /opt/conda/envs/ros2/etc/conda/activate.d/torch_lib.sh
-
-# SAM2 checkpoints.
-RUN cd /opt/sam2/checkpoints && bash download_ckpts.sh
-
-# -----------------------------------------------------------------------------
-# 3) FoundationPose `my` env (Python 3.9): add rclpy + cv_bridge so fp_ros_node
-#    can run as a ROS2 node. RoboStack's rclpy pulls in numpy 2.x / new opencv,
-#    which breaks FoundationPose's deps, so we pin them back immediately after.
+# 1) ROS2 Humble + cv_bridge + RealSense driver into the existing `my` env
+#    (Python 3.11). No separate ros2 env needed.
+#
+#    NOTE on librealsense: this image's RoboStack librealsense (~2.55) cannot
+#    talk to the D455 firmware 5.17 reliably (control_transfer floods, depth
+#    throttles). The pipeline therefore runs RealSense on the HOST (librealsense
+#    2.58, matches fw 5.17) and this container subscribes over DDS. With the
+#    CycloneDDS buffer tuning in step 4, BOTH aligned and raw depth arrive at a
+#    clean 30 Hz — the earlier "aligned is slow" symptom was DDS packet loss,
+#    not the alignment warp, so either depth topic is fine.
 # -----------------------------------------------------------------------------
 RUN conda run -n my conda config --env --add channels conda-forge \
   && conda run -n my conda config --env --add channels robostack-humble \
   && conda run -n my conda config --env --remove channels defaults || true \
   && conda run -n my conda install -y \
-       ros-humble-rclpy \
-       ros-humble-cv-bridge
+       ros-humble-desktop \
+       ros-humble-cv-bridge \
+       ros-humble-realsense2-camera \
+       ros-humble-rmw-cyclonedds-cpp
 
-# Pin the versions verified to work with FoundationPose (numpy 1.x toolchain).
-# opencv 4.10 is the last line that does NOT force numpy>=2.
-RUN conda run -n my pip install \
-    "numpy==1.26.4" "scipy==1.11.4" "trimesh==3.23.5" \
-    "opencv-python==4.10.0.84" "opencv-contrib-python==4.10.0.84" \
-    --force-reinstall --no-deps
+# RoboStack's activate.d sets PYTHONPATH, which interferes with imports.
+# zzz_ prefix ensures this script runs last among all activate.d scripts.
+# Also set LD_LIBRARY_PATH for sam2._C (added in step 3 below via >>).
+RUN mkdir -p /opt/conda/envs/my/etc/conda/activate.d \
+    && echo 'export PYTHONPATH=""' \
+       > /opt/conda/envs/my/etc/conda/activate.d/zzz_env.sh
+
+# RoboStack installs opencv / numpy as CONDA packages (no pip RECORD), and also
+# upgrades numpy/scipy, breaking the FoundationPose numpy 1.x toolchain.
+# Remove the conda opencv, wipe any mixed-version dirs, then clean-install the
+# verified pip versions. rm -rf avoids the file-mixing that --ignore-installed
+# leaves behind (e.g. trimesh 4.x files under a 3.23.5 install).
+# trimesh itself is pinned in the BASE image, so it is not re-installed here.
+RUN PYTHONPATH='' conda run -n my conda remove -y --force \
+        libopencv opencv py-opencv || true
+RUN rm -rf /opt/conda/envs/my/lib/python3.11/site-packages/cv2 \
+           /opt/conda/envs/my/lib/python3.11/site-packages/opencv_python* \
+           /opt/conda/envs/my/lib/python3.11/site-packages/numpy* \
+           /opt/conda/envs/my/lib/python3.11/site-packages/scipy* \
+    && PYTHONPATH='' conda run -n my pip install --no-cache-dir --no-deps \
+        "numpy==1.26.4" "scipy==1.11.4" \
+        "opencv-python==4.10.0.84" \
+        "opencv-contrib-python==4.10.0.84"
+
+# cv2 ships its own Qt5 xcb plugin (built against the mangled Qt5 bundled in
+# opencv_python.libs). Do NOT overwrite it with the system Qt6 xcb: Qt5 loading
+# a Qt6 plugin aborts ("Could not load xcb"). A clean reinstall restores cv2's
+# own matching Qt5 xcb. Note: SAM2's matplotlib window does NOT use cv2's Qt at
+# all — the actual SAM2 crash fix is clearing QT_QPA_PLATFORM_PLUGIN_PATH inside
+# sam2_ros_node.py (committed upstream), so cv2 does not poison matplotlib's Qt.
+RUN PYTHONPATH='' conda run -n my pip install --force-reinstall --no-deps \
+        "opencv-python==4.10.0.84"
 
 # -----------------------------------------------------------------------------
-# 4) Cleanup (safe size reduction only; does not touch the working set).
+# 2) SAM2 real-time fork. torch is already pinned in the base image so pip
+#    will not pull a conflicting version here.
 # -----------------------------------------------------------------------------
-RUN conda clean -afy \
-    && conda run -n ros2 pip cache purge || true \
-    && conda run -n my pip cache purge || true \
+RUN git clone --branch main \
+    https://github.com/hyomuk-kim/segment-anything-2-real-time.git \
+    /opt/sam2
+
+# SAM2 runtime deps only (torch/torchvision already present in `my`).
+RUN PYTHONPATH='' conda run -n my pip install --no-build-isolation \
+    hydra-core iopath tqdm pillow
+
+# Register SAM2 on sys.path without triggering a full pip install
+# (which would re-resolve torch and potentially upgrade it).
+RUN echo "/opt/sam2" \
+    > /opt/conda/envs/my/lib/python3.11/site-packages/sam2.pth
+
+# Build the sam2._C CUDA extension for arch 8.9 (RTX 4080 Ada).
+RUN cd /opt/sam2 \
+    && PYTHONPATH='' TORCH_CUDA_ARCH_LIST="8.9" conda run -n my \
+       python setup.py build_ext --inplace
+
+# _C.so links against libc10.so / libtorch. Append to the activation script
+# created above so LD_LIBRARY_PATH is set alongside PYTHONPATH.
+RUN echo 'export LD_LIBRARY_PATH=/opt/conda/envs/my/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH' \
+    >> /opt/conda/envs/my/etc/conda/activate.d/zzz_env.sh
+
+# SAM2 checkpoint — large model as required by sam2_model.py.
+# sam2_hiera_large.pt (~900 MB). Only this one is needed.
+RUN wget -q -P /opt/sam2/checkpoints \
+    https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt
+
+# -----------------------------------------------------------------------------
+# 4) CycloneDDS tuning — prevent large-image (depth) DDS packet loss.
+#    848x480 depth (~814KB) overflows default DDS buffers and drops in bursts
+#    ("A message was lost!!!"), throttling effective depth to ~1-16 Hz while
+#    color (smaller, single packets) stays at 30. Larger socket/whc buffers fix
+#    it. The matching host-side kernel buffers (net.core.rmem_max, ipfrag_*) are
+#    NOT set here — they are host kernel params shared by the privileged
+#    container and must be set on the host (sysctl).
+#
+#    xml is written inline (not COPYed) so the image is self-contained and the
+#    config can never silently go missing (a recurring failure mode when the
+#    env var pointed at a file that did not exist in the container).
+# -----------------------------------------------------------------------------
+RUN printf '%s\n' \
+'<?xml version="1.0" encoding="UTF-8" ?>' \
+'<CycloneDDS xmlns="https://cdds.io/config"' \
+'    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"' \
+'    xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">' \
+'  <Domain Id="any">' \
+'    <General>' \
+'      <Interfaces>' \
+'        <NetworkInterface autodetermine="true" priority="default" multicast="default" />' \
+'      </Interfaces>' \
+'      <AllowMulticast>default</AllowMulticast>' \
+'      <MaxMessageSize>65500B</MaxMessageSize>' \
+'    </General>' \
+'    <Internal>' \
+'      <SocketReceiveBufferSize min="10MB"/>' \
+'      <Watermarks>' \
+'        <WhcHigh>500kB</WhcHigh>' \
+'      </Watermarks>' \
+'    </Internal>' \
+'  </Domain>' \
+'</CycloneDDS>' \
+    > /root/cyclonedds.xml
+
+# ENV (not .bashrc) so EVERY process in the container inherits it, regardless of
+# which shell or launch method starts the node. .bashrc only applies to
+# interactive login shells and was a source of "URI set but empty in this shell"
+# bugs.
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ENV CYCLONEDDS_URI=file:///root/cyclonedds.xml
+
+# -----------------------------------------------------------------------------
+# 5) Cleanup
+# -----------------------------------------------------------------------------
+RUN PYTHONPATH='' conda run -n my pip cache purge || true \
+    && conda clean -afy \
     && rm -rf /root/.cache/pip
