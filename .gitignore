@@ -156,3 +156,16 @@ data/
 logs/
 !BundleTrack/XMem/inference/data
 run_used.yml
+
+# OSTrack ported source (name collides with the generic lib/ ignore above)
+!/ostrack_lib/
+!/ostrack_lib/lib/
+!/ostrack_lib/lib/**
+!/ostrack_lib/lib/train/data/
+!/ostrack_lib/lib/train/data/**
+
+# macOS
+.DS_Store
+
+# OSTrack checkpoint — download separately, don't commit to git
+/ostrack_lib/checkpoints/*.pth.tar

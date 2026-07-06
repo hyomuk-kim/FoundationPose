@@ -7,9 +7,12 @@ and publishes the object pose as PoseStamped on /object_pose.
 """
 
 import os
+import sys
 import time
+import math
 import numpy as np
 import cv2
+import torch
 import nvdiffrast.torch as dr
 import rclpy
 import trimesh
@@ -30,6 +33,159 @@ from Utils import (
     set_logging_format,
     set_seed,
 )
+
+
+def _hann2d(sz: int) -> torch.Tensor:
+    """Center-weighted mask multiplied into the score map: keeps detections
+    near the previous position, suppresses far-away look-alike distractors."""
+    w = 0.5 * (1 - torch.cos(
+        (2 * math.pi / (sz + 1)) * torch.arange(1, sz + 1).float()))
+    return w.reshape(1, 1, -1, 1) * w.reshape(1, 1, 1, -1)
+
+
+class Tracker2D:
+    """OSTrack (vitb_256_mae_ce_32x4_ep300) wrapper for per-frame bbox
+    tracking, independent of FP's own pose estimate. Ported from
+    lib/test/tracker/{ostrack.py,data_utils.py} + lib/test/parameter/ostrack.py
+    (botaoye/OSTrack), stripped of PyTracking's debug/visdom/eval scaffolding.
+
+    ostrack_lib_dir: path to the pruned `lib/` + `experiments/` subset copied
+    from the OSTrack repo (see fp_ros_node README section on 2D tracker setup).
+    checkpoint_path: path to the released OSTrack_ep0300.pth.tar checkpoint
+    (Google Drive link in OSTrack's README) — NOT mae_pretrain_vit_base.pth.
+    """
+
+    def __init__(self,
+                 ostrack_lib_dir,
+                 checkpoint_path,
+                 min_score=0.5,
+                 yaml_name="vitb_256_mae_ce_32x4_ep300"):
+        self.min_score = min_score
+        self.initialized = False
+
+        if ostrack_lib_dir not in sys.path:
+            sys.path.insert(0, ostrack_lib_dir)
+        # Deferred import: only resolvable once ostrack_lib_dir is on sys.path.
+        from lib.config.ostrack.config import cfg, update_config_from_file
+        from lib.models.ostrack import build_ostrack
+
+        yaml_file = os.path.join(ostrack_lib_dir, "experiments", "ostrack",
+                                 f"{yaml_name}.yaml")
+        update_config_from_file(yaml_file)
+        self.cfg = cfg
+
+        network = build_ostrack(cfg, training=False)
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        network.load_state_dict(ckpt["net"], strict=True)
+        self.network = network.cuda().eval()
+
+        self.template_factor = cfg.TEST.TEMPLATE_FACTOR
+        self.template_size = cfg.TEST.TEMPLATE_SIZE
+        self.search_factor = cfg.TEST.SEARCH_FACTOR
+        self.search_size = cfg.TEST.SEARCH_SIZE
+
+        feat_sz = cfg.TEST.SEARCH_SIZE // cfg.MODEL.BACKBONE.STRIDE
+        self.output_window = _hann2d(feat_sz).cuda()
+
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).cuda()
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).cuda()
+
+        self.z_dict1 = None
+        self.box_mask_z = None
+        self.state = None  # xywh, image coords
+
+    def _preprocess(self, img_arr):
+        # forward() doesn't consume the attention mask sample_target returns,
+        # so only the normalized image tensor is kept (no NestedTensor needed).
+        t = torch.tensor(img_arr).cuda().float().permute(2, 0, 1).unsqueeze(0)
+        return (t / 255.0 - self.mean) / self.std
+
+    def init(self, rgb, bbox_xyxy):
+        from lib.train.data.processing_utils import sample_target
+        from lib.utils.ce_utils import generate_mask_cond
+
+        x1, y1, x2, y2 = bbox_xyxy
+        init_bbox = [x1, y1, x2 - x1, y2 - y1]  # OSTrack uses xywh internally
+
+        z_patch_arr, _, _ = sample_target(rgb,
+                                          init_bbox,
+                                          self.template_factor,
+                                          output_sz=self.template_size)
+        self.z_dict1 = self._preprocess(z_patch_arr)
+
+        self.box_mask_z = None
+        if self.cfg.MODEL.BACKBONE.CE_LOC:
+            # CE_TEMPLATE_RANGE is 'CTR_POINT' for this config, which only
+            # needs (bs, device) — no bbox projection required.
+            self.box_mask_z = generate_mask_cond(self.cfg, 1,
+                                                 self.z_dict1.device, None)
+
+        self.state = init_bbox
+        self.initialized = True
+
+    def track(self, rgb):
+        """Returns (bbox_xyxy, score); (None, 0.0) if not initialized."""
+        if not self.initialized:
+            return None, 0.0
+
+        from lib.train.data.processing_utils import sample_target
+        from lib.utils.box_ops import clip_box
+
+        H, W = rgb.shape[:2]
+        x_patch_arr, resize_factor, _ = sample_target(
+            rgb, self.state, self.search_factor, output_sz=self.search_size)
+        search = self._preprocess(x_patch_arr)
+
+        with torch.no_grad():
+            out = self.network.forward(template=self.z_dict1,
+                                       search=search,
+                                       ce_template_mask=self.box_mask_z)
+
+        response = self.output_window * out["score_map"]
+        pred_box, score = self.network.box_head.cal_bbox(response,
+                                                         out["size_map"],
+                                                         out["offset_map"],
+                                                         return_score=True)
+        cx, cy, w, h = pred_box.view(-1).tolist()
+        scale = self.search_size / resize_factor
+        pred_box_img = [cx * scale, cy * scale, w * scale, h * scale]
+
+        cx_prev = self.state[0] + 0.5 * self.state[2]
+        cy_prev = self.state[1] + 0.5 * self.state[3]
+        half_side = 0.5 * scale
+        cx_r, cy_r, w_r, h_r = pred_box_img
+        new_state = [
+            cx_r + (cx_prev - half_side) - 0.5 * w_r,
+            cy_r + (cy_prev - half_side) - 0.5 * h_r, w_r, h_r
+        ]
+        self.state = clip_box(new_state, H, W, margin=10)
+
+        x, y, w, h = self.state
+        return (x, y, x + w, y + h), float(score.item())
+
+
+class AngularVelocityKF:
+    """Minimal scalar-covariance KF over 3D angular velocity (rad/step),
+    used to predict rotation ahead of the refiner each frame."""
+
+    def __init__(self, process_var=0.05, measured_var=0.02, init_var=1.0):
+        self.omega = np.zeros(3)
+        self.var = init_var
+        self.q = process_var
+        self.r = measured_var
+
+    def predict(self):
+        self.var += self.q
+        return self.omega.copy()
+
+    def update(self, measured_omega):
+        k = self.var / (self.var + self.r)
+        self.omega = self.omega + k * (measured_omega - self.omega)
+        self.var = (1 - k) * self.var
+
+    def reset(self):
+        self.omega = np.zeros(3)
+        self.var = 1.0
 
 
 class FoundationPoseROS2(Node):
@@ -55,6 +211,16 @@ class FoundationPoseROS2(Node):
         self.pose_last_prev = None
         self.max_translation_step = 0.1  # reject >10cm/frame jumps as glitches
 
+        # FP++-style prior: 2D tracker for translation, KF for rotation.
+        # Off by default until Tracker2D.model is wired up. Falls back to
+        # CV prior if the 2D tracker is uninitialized/low-score.
+        self.use_2d_tracker_prior = False
+        self._ostrack_lib_dir = f"{os.path.dirname(os.path.realpath(__file__))}/ostrack_lib"
+        self._ostrack_checkpoint = f"{self._ostrack_lib_dir}/checkpoints/OSTrack_ep0300.pth.tar"
+        self.tracker2d = None  # built lazily by _ensure_tracker2d(), only if enabled
+        self.rot_kf = AngularVelocityKF()
+        self.kf_rot_prev = None  # rotation at last accepted pose (t-1)
+
         # Mask-gated tracking: zero depth outside the SAM2 mask before tracking.
         self.use_mask_gating = True
         self.mask_gating_min_pixels = 100  # below this, mask is empty -> skip gating
@@ -63,9 +229,9 @@ class FoundationPoseROS2(Node):
 
         # Auto-reset parameters for spatial drift detection
         self.use_auto_reset = True
-        self.auto_reset_patience = 3       # Consecutive frames required to trigger reset
+        self.auto_reset_patience = 3  # Consecutive frames required to trigger reset
         self.drift_counter = 0
-        self.max_center_dist_px = 30.0     # Max pixel distance between SAM2 and FP centers
+        self.max_center_dist_px = 30.0  # Max pixel distance between SAM2 and FP centers
 
         # Refinement iterations
         self.first_est_refine_iter = 5  # Higher quality for first registration
@@ -229,15 +395,22 @@ class FoundationPoseROS2(Node):
         self.first = False
         self.pose_last_prev = None  # reset CV-prior history after re-registration
 
+        if self.use_2d_tracker_prior:
+            x, y, w, h = cv2.boundingRect(mask.astype(np.uint8))
+            self._ensure_tracker2d().init(rgb, (x, y, x + w, y + h))
+            self.rot_kf.reset()
+            self.kf_rot_prev = self.FPModel.pose_last.detach().cpu().numpy(
+            )[:3, :3].copy()
+
     def _track(self):
         """Frame-to-frame tracking."""
         rgb = self.process_rgb(self.latest_rgb)
         depth = self.process_depth(self.latest_depth)
         cam_K = self.latest_cam_K.copy()
 
-        # Mask-gate depth + apply constant-velocity prior before tracking.
+        # Mask-gate depth + seed pose_last (2D-tracker+KF prior, or CV-prior fallback).
         depth = self.gate_depth_by_mask(depth)
-        self.apply_cv_prior()
+        self.apply_2d_kf_prior(rgb, depth, cam_K)
 
         t0 = time.time()
         pose = self.FPModel.track_one(rgb=rgb,
@@ -250,7 +423,7 @@ class FoundationPoseROS2(Node):
         if self.check_auto_reset(pose, cam_K):
             return  # Abort publishing this frame and re-register next frame
 
-        self.update_cv_prior_history()
+        self.update_2d_kf_prior_history()
         self.publish_pose(pose)
 
         if self.visualize:
@@ -305,6 +478,15 @@ class FoundationPoseROS2(Node):
 
     def process_mask(self, mask):
         return mask.astype(bool)
+
+    def _ensure_tracker2d(self):
+        """Lazily build Tracker2D on first use, so a missing checkpoint/lib
+        dir only breaks things when use_2d_tracker_prior is actually on."""
+        if self.tracker2d is None:
+            self.tracker2d = Tracker2D(self._ostrack_lib_dir,
+                                       self._ostrack_checkpoint,
+                                       min_score=0.5)
+        return self.tracker2d
 
     def gate_depth_by_mask(self, depth):
         """Zero depth outside the dilated SAM2 mask. Falls back to ungated depth
@@ -375,7 +557,6 @@ class FoundationPoseROS2(Node):
         u, _, vt = np.linalg.svd(pred[:3, :3])
         pred[:3, :3] = u @ vt
 
-        import torch
         self.FPModel.pose_last = torch.as_tensor(pred,
                                                  dtype=pose_last.dtype,
                                                  device=pose_last.device)
@@ -387,6 +568,83 @@ class FoundationPoseROS2(Node):
         if pose_last is None:
             return
         self.pose_last_prev = pose_last.detach().cpu().numpy().reshape(4, 4)
+
+    # ---------- FP++-style prior: 2D tracker (translation) + KF (rotation) ----------
+
+    def estimate_translation_from_bbox(self, bbox_xyxy, depth, K):
+        """Backproject bbox center + median depth inside it to a 3D point.
+        Mirrors estimater.guess_translation() but driven by a 2D bbox."""
+        x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+        uc, vc = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        patch = depth[max(y1, 0):y2, max(x1, 0):x2]
+        valid = patch > 0.001
+        if not valid.any():
+            return None
+        zc = np.median(patch[valid])
+        center = (np.linalg.inv(K) @ np.array([uc, vc, 1.0]).reshape(3, 1)) * zc
+        return center.reshape(3)
+
+    def apply_2d_kf_prior(self, rgb, depth, cam_K):
+        """Seed pose_last translation from the 2D tracker + depth, rotation
+        from the angular-velocity KF prediction. Falls back to apply_cv_prior()
+        if the 2D tracker is off, uninitialized, or low-confidence."""
+        if not self.use_2d_tracker_prior:
+            self.apply_cv_prior()
+            return
+
+        tracker2d = self._ensure_tracker2d()
+        bbox, score = tracker2d.track(rgb)
+        if bbox is None or score < tracker2d.min_score:
+            self.get_logger().warn(
+                f"2D tracker low-confidence ({score:.2f}) — falling back to CV prior",
+                throttle_duration_sec=2.0)
+            self.apply_cv_prior()
+            return
+
+        pose_last = self.FPModel.pose_last
+        if pose_last is None or self.kf_rot_prev is None:
+            self.apply_cv_prior()
+            return
+
+        t_2d = self.estimate_translation_from_bbox(bbox, depth, cam_K)
+        if t_2d is None:
+            self.apply_cv_prior()
+            return
+
+        cur = pose_last.detach().cpu().numpy().reshape(4, 4)
+        trans_step = np.linalg.norm(t_2d - cur[:3, 3])
+        if trans_step > self.max_translation_step:
+            self.get_logger().warn(
+                f"2D-tracker jump {trans_step*100:.1f} cm too large — skipping",
+                throttle_duration_sec=2.0)
+            return
+
+        omega_pred = self.rot_kf.predict()
+        R_pred = R.from_rotvec(omega_pred).as_matrix() @ self.kf_rot_prev
+
+        pred = cur.copy()
+        pred[:3, :3] = R_pred
+        pred[:3, 3] = t_2d.flatten()
+        u, _, vt = np.linalg.svd(pred[:3, :3])
+        pred[:3, :3] = u @ vt
+
+        self.FPModel.pose_last = torch.as_tensor(pred,
+                                                 dtype=pose_last.dtype,
+                                                 device=pose_last.device)
+
+    def update_2d_kf_prior_history(self):
+        """After track_one refines the pose: update the rotation KF with the
+        refined rotation as measurement, and keep the CV-prior fallback warm."""
+        self.update_cv_prior_history()  # keep fallback path ready regardless
+        if not self.use_2d_tracker_prior or self.kf_rot_prev is None:
+            return
+        pose_last = self.FPModel.pose_last
+        if pose_last is None:
+            return
+        cur_R = pose_last.detach().cpu().numpy().reshape(4, 4)[:3, :3]
+        omega_meas = R.from_matrix(cur_R @ self.kf_rot_prev.T).as_rotvec()
+        self.rot_kf.update(omega_meas)
+        self.kf_rot_prev = cur_R.copy()
 
     # ---------- auto-reset with centroid distance ----------
 
