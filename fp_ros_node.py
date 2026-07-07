@@ -211,10 +211,13 @@ class FoundationPoseROS2(Node):
         self.pose_last_prev = None
         self.max_translation_step = 0.1  # reject >10cm/frame jumps as glitches
 
-        # FP++-style prior: 2D tracker for translation, KF for rotation.
-        # Off by default until Tracker2D.model is wired up. Falls back to
-        # CV prior if the 2D tracker is uninitialized/low-score.
-        self.use_2d_tracker_prior = False
+        # FP++-style prior, split into two independently-toggleable parts:
+        #   translation  -> 2D tracker (OSTrack) + depth backprojection
+        #   rotation     -> angular-velocity KF (optional; leave off to let the
+        #                   refiner handle rotation from the unchanged prev pose)
+        # Both off => behaves exactly like the CV-prior path.
+        self.use_2d_tracker_translation = False
+        self.use_rotation_kf = False
         self._ostrack_lib_dir = f"{os.path.dirname(os.path.realpath(__file__))}/ostrack_lib"
         self._ostrack_checkpoint = f"{self._ostrack_lib_dir}/checkpoints/OSTrack_ep0300.pth.tar"
         self.tracker2d = None  # built lazily by _ensure_tracker2d(), only if enabled
@@ -395,9 +398,10 @@ class FoundationPoseROS2(Node):
         self.first = False
         self.pose_last_prev = None  # reset CV-prior history after re-registration
 
-        if self.use_2d_tracker_prior:
+        if self.use_2d_tracker_translation:
             x, y, w, h = cv2.boundingRect(mask.astype(np.uint8))
             self._ensure_tracker2d().init(rgb, (x, y, x + w, y + h))
+        if self.use_rotation_kf:
             self.rot_kf.reset()
             self.kf_rot_prev = self.FPModel.pose_last.detach().cpu().numpy(
             )[:3, :3].copy()
@@ -481,7 +485,7 @@ class FoundationPoseROS2(Node):
 
     def _ensure_tracker2d(self):
         """Lazily build Tracker2D on first use, so a missing checkpoint/lib
-        dir only breaks things when use_2d_tracker_prior is actually on."""
+        dir only breaks things when use_2d_tracker_translation is actually on."""
         if self.tracker2d is None:
             self.tracker2d = Tracker2D(self._ostrack_lib_dir,
                                        self._ostrack_checkpoint,
@@ -585,48 +589,52 @@ class FoundationPoseROS2(Node):
         return center.reshape(3)
 
     def apply_2d_kf_prior(self, rgb, depth, cam_K):
-        """Seed pose_last translation from the 2D tracker + depth, rotation
-        from the angular-velocity KF prediction. Falls back to apply_cv_prior()
-        if the 2D tracker is off, uninitialized, or low-confidence."""
-        if not self.use_2d_tracker_prior:
-            self.apply_cv_prior()
-            return
-
-        tracker2d = self._ensure_tracker2d()
-        bbox, score = tracker2d.track(rgb)
-        if bbox is None or score < tracker2d.min_score:
-            self.get_logger().warn(
-                f"2D tracker low-confidence ({score:.2f}) — falling back to CV prior",
-                throttle_duration_sec=2.0)
+        """Seed pose_last with independently-toggleable priors:
+          translation <- 2D tracker + depth (if use_2d_tracker_translation)
+          rotation    <- angular-velocity KF (if use_rotation_kf), else left as
+                         the previous pose's rotation for the refiner to handle.
+        Falls back to apply_cv_prior() when neither translation nor rotation
+        prior is active, or when the 2D tracker is unavailable/low-confidence."""
+        if not self.use_2d_tracker_translation and not self.use_rotation_kf:
             self.apply_cv_prior()
             return
 
         pose_last = self.FPModel.pose_last
-        if pose_last is None or self.kf_rot_prev is None:
+        if pose_last is None:
             self.apply_cv_prior()
             return
-
-        t_2d = self.estimate_translation_from_bbox(bbox, depth, cam_K)
-        if t_2d is None:
-            self.apply_cv_prior()
-            return
-
         cur = pose_last.detach().cpu().numpy().reshape(4, 4)
-        trans_step = np.linalg.norm(t_2d - cur[:3, 3])
-        if trans_step > self.max_translation_step:
-            self.get_logger().warn(
-                f"2D-tracker jump {trans_step*100:.1f} cm too large — skipping",
-                throttle_duration_sec=2.0)
-            return
-
-        omega_pred = self.rot_kf.predict()
-        R_pred = R.from_rotvec(omega_pred).as_matrix() @ self.kf_rot_prev
-
         pred = cur.copy()
-        pred[:3, :3] = R_pred
-        pred[:3, 3] = t_2d.flatten()
-        u, _, vt = np.linalg.svd(pred[:3, :3])
-        pred[:3, :3] = u @ vt
+
+        # --- translation prior: 2D tracker bbox + depth backprojection ---
+        if self.use_2d_tracker_translation:
+            tracker2d = self._ensure_tracker2d()
+            bbox, score = tracker2d.track(rgb)
+            if bbox is None or score < tracker2d.min_score:
+                self.get_logger().warn(
+                    f"2D tracker low-confidence ({score:.2f}) — falling back to CV prior",
+                    throttle_duration_sec=2.0)
+                self.apply_cv_prior()
+                return
+            t_2d = self.estimate_translation_from_bbox(bbox, depth, cam_K)
+            if t_2d is None:
+                self.apply_cv_prior()
+                return
+            trans_step = np.linalg.norm(t_2d - cur[:3, 3])
+            if trans_step > self.max_translation_step:
+                self.get_logger().warn(
+                    f"2D-tracker jump {trans_step*100:.1f} cm too large — skipping",
+                    throttle_duration_sec=2.0)
+            else:
+                pred[:3, 3] = t_2d.flatten()
+
+        # --- rotation prior: angular-velocity KF (optional) ---
+        if self.use_rotation_kf and self.kf_rot_prev is not None:
+            omega_pred = self.rot_kf.predict()
+            R_pred = R.from_rotvec(omega_pred).as_matrix() @ self.kf_rot_prev
+            pred[:3, :3] = R_pred
+            u, _, vt = np.linalg.svd(pred[:3, :3])
+            pred[:3, :3] = u @ vt
 
         self.FPModel.pose_last = torch.as_tensor(pred,
                                                  dtype=pose_last.dtype,
@@ -636,14 +644,14 @@ class FoundationPoseROS2(Node):
         """After track_one refines the pose: update the rotation KF with the
         refined rotation as measurement, and keep the CV-prior fallback warm."""
         self.update_cv_prior_history()  # keep fallback path ready regardless
-        if not self.use_2d_tracker_prior or self.kf_rot_prev is None:
+        if not self.use_rotation_kf or self.kf_rot_prev is None:
             return
         pose_last = self.FPModel.pose_last
         if pose_last is None:
             return
         cur_R = pose_last.detach().cpu().numpy().reshape(4, 4)[:3, :3]
-        omega_meas = R.from_matrix(cur_R @ self.kf_rot_prev.T).as_rotvec()
-        self.rot_kf.update(omega_meas)
+        measured_omega = R.from_matrix(cur_R @ self.kf_rot_prev.T).as_rotvec()
+        self.rot_kf.update(measured_omega)
         self.kf_rot_prev = cur_R.copy()
 
     # ---------- auto-reset with centroid distance ----------
