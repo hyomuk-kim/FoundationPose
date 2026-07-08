@@ -202,6 +202,9 @@ class FoundationPoseROS2(Node):
         self.latest_cam_K = None
         self.latest_mask = None
         self.latest_mask_stamp = None  # arrival time of latest mask (staleness)
+        self.latest_mask_stamp = None  # arrival time of latest mask (staleness)
+        self._latest_mask_area = 0     # pixel count of latest ACCEPTED mask (area sanity check)
+        self.mask_area_max_ratio = 1.7  # reject a new mask if area changes by more than this factor
         self.is_object_registered = False
         self.first = True
 
@@ -216,7 +219,7 @@ class FoundationPoseROS2(Node):
         #   rotation     -> angular-velocity KF (optional; leave off to let the
         #                   refiner handle rotation from the unchanged prev pose)
         # Both off => behaves exactly like the CV-prior path.
-        self.use_2d_tracker_translation = False
+        self.use_2d_tracker_translation = True
         self.use_rotation_kf = False
         self._ostrack_lib_dir = f"{os.path.dirname(os.path.realpath(__file__))}/ostrack_lib"
         self._ostrack_checkpoint = f"{self._ostrack_lib_dir}/checkpoints/OSTrack_ep0300.pth.tar"
@@ -234,7 +237,7 @@ class FoundationPoseROS2(Node):
         self.use_auto_reset = True
         self.auto_reset_patience = 3  # Consecutive frames required to trigger reset
         self.drift_counter = 0
-        self.max_center_dist_px = 30.0  # Max pixel distance between SAM2 and FP centers
+        self.max_center_dist_px = 25  # Max pixel distance between SAM2 and FP centers
 
         # Refinement iterations
         self.first_est_refine_iter = 5  # Higher quality for first registration
@@ -332,10 +335,26 @@ class FoundationPoseROS2(Node):
 
     def mask_callback(self, data):
         try:
-            self.latest_mask = self.bridge.imgmsg_to_cv2(data, "mono8")
-            self.latest_mask_stamp = self.get_clock().now()
+            mask = self.bridge.imgmsg_to_cv2(data, "mono8")
         except CvBridgeError as e:
             self.get_logger().error(f"Mask conversion failed: {e}")
+            return
+
+        # Area sanity check: SAM2 occasionally grabs a contaminated boundary and
+        # the mask size jumps abruptly. Reject it and keep the last good mask.
+        area = int((mask > 0).sum())
+        if self.latest_mask is not None and self._latest_mask_area > 0:
+            ratio = area / self._latest_mask_area
+            if ratio > self.mask_area_max_ratio or ratio < 1.0 / self.mask_area_max_ratio:
+                self.get_logger().warn(
+                    f"Mask area jump {self._latest_mask_area}->{area}px "
+                    f"(x{ratio:.2f}) — rejecting, keeping previous mask",
+                    throttle_duration_sec=2.0)
+                return
+
+        self.latest_mask = mask
+        self._latest_mask_area = area
+        self.latest_mask_stamp = self.get_clock().now()
 
     def cam_K_callback(self, data: CameraInfo):
         self.latest_cam_K = np.array(data.k).reshape(3, 3)
