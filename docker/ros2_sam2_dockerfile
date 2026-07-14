@@ -99,7 +99,7 @@ RUN wget -q -P /opt/sam2/checkpoints \
     https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt
 
 # -----------------------------------------------------------------------------
-# 4) CycloneDDS tuning — prevent large-image (depth) DDS packet loss.
+# 3) CycloneDDS tuning — prevent large-image (depth) DDS packet loss.
 #    848x480 depth (~814KB) overflows default DDS buffers and drops in bursts
 #    ("A message was lost!!!"), throttling effective depth to ~1-16 Hz while
 #    color (smaller, single packets) stays at 30. Larger socket/whc buffers fix
@@ -140,6 +140,15 @@ RUN printf '%s\n' \
 # bugs.
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV CYCLONEDDS_URI=file:///root/cyclonedds.xml
+
+# -----------------------------------------------------------------------------
+# 4) OSTrack (FP++-style 2D-tracker prior) inference-only deps.
+#    Pure-python, no compiled extensions — see ostrack_lib/ (ce_utils.py etc.
+#    confirmed no CUDA kernels). torchvision omitted if already present
+#    (check first: `conda run -n my python -c "import torchvision"`).
+# -----------------------------------------------------------------------------
+RUN PYTHONPATH='' conda run -n my pip install --no-cache-dir --no-deps \
+        timm easydict pyyaml
 
 # -----------------------------------------------------------------------------
 # 5) Cleanup
