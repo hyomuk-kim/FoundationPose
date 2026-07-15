@@ -680,15 +680,20 @@ class FoundationPoseROS2(Node):
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                 (255, 255, 255), 2, cv2.LINE_AA)
 
-        # Depth residual text (independent of SAM2)
+        # Depth residual text (independent of SAM2). Always print covis / occ%,
+        # even on n/a, so the two failure causes are distinguishable:
+        #   - low covis  : n_covis below the min (few co-visible pixels at all)
+        #   - heavy excl : n_covis fine but most pixels excluded as "occluded"
+        #                  (broad exclusion -> a pose error masquerading as occ)
         residual, n_covis, n_occ = self.compute_depth_residual(
             rendered_depth, observed_depth)
+        occ_frac = n_occ / max(1, n_covis)
         if residual is not None:
-            occ_frac = n_occ / max(1, n_covis)
             txt = (f"depth_res={residual*1000:.1f}mm  "
                    f"occ={occ_frac*100:.0f}%  covis={n_covis}")
         else:
-            txt = "depth_res=n/a (low covis / heavy occ)"
+            txt = (f"depth_res=n/a  covis={n_covis}  occ={occ_frac*100:.0f}%  "
+                   f"(min covis={self.depth_residual_min_covisible_px})")
         cv2.putText(overlay, txt, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 255, 255), 2, cv2.LINE_AA)
 
