@@ -10,6 +10,7 @@ import os
 import time
 import numpy as np
 import cv2
+import torch
 import nvdiffrast.torch as dr
 import rclpy
 import trimesh
@@ -27,6 +28,7 @@ from fp_ros_utils import get_mesh_file
 from Utils import (
     draw_posed_3d_box,
     draw_xyz_axis,
+    nvdiffrast_render,
     set_logging_format,
     set_seed,
 )
@@ -86,6 +88,14 @@ class FoundationPoseROS2(Node):
             "visualize").get_parameter_value().bool_value
         self.latest_vis_img = None
 
+        # Debug visualization: render the FP mesh silhouette at the tracked pose
+        # (the same geometry the refiner compares against internally) and publish
+        # it alongside the SAM2 mask so drift can be inspected in rqt.
+        # Toggle at launch with -p debug_viz:=false to save the per-frame render.
+        self.declare_parameter("debug_viz", True)
+        self.debug_viz = self.get_parameter(
+            "debug_viz").get_parameter_value().bool_value
+
         # Processing lock to prevent overlapping timer calls
         self.is_processing = False
 
@@ -142,6 +152,12 @@ class FoundationPoseROS2(Node):
 
         # Publisher: PoseStamped instead of Pose (adds timestamp)
         self.pose_pub = self.create_publisher(PoseStamped, "/object_pose", 1)
+
+        # Debug-viz publishers: FP silhouette mask + RGB overlay (view in rqt).
+        self.render_mask_pub = self.create_publisher(
+            ROSImage, "/fp_render_mask", 1)
+        self.debug_overlay_pub = self.create_publisher(
+            ROSImage, "/fp_debug_overlay", 1)
 
         # Timer-driven main loop (runs as fast as GPU allows)
         self.timer = self.create_timer(0.01, self.run_once)
@@ -246,6 +262,11 @@ class FoundationPoseROS2(Node):
                                       iteration=self.track_refine_iter)
         elapsed_ms = (time.time() - t0) * 1000
         self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
+
+        # Publish debug viz before the reset check so borderline / stuck frames
+        # (which do NOT trigger a reset) are still inspectable in rqt.
+        if self.debug_viz:
+            self.publish_debug_viz(rgb, pose, cam_K)
 
         if self.check_auto_reset(pose, cam_K):
             return  # Abort publishing this frame and re-register next frame
@@ -434,6 +455,101 @@ class FoundationPoseROS2(Node):
             return True
 
         return False
+
+    # ---------- debug visualization ----------
+
+    def render_fp_silhouette(self, pose: np.ndarray, cam_K: np.ndarray,
+                             H: int, W: int) -> np.ndarray:
+        """Render the FP mesh at the tracked pose and return its binary
+        silhouette (uint8, 0/255). Uses the SAME centered mesh_tensors and
+        pose_last convention the refiner compares against internally, so the
+        result reflects exactly what FoundationPose "sees" as the object."""
+        ob_in_cam = torch.as_tensor(
+            pose.reshape(1, 4, 4), device="cuda", dtype=torch.float)
+        _, depth_r, _ = nvdiffrast_render(
+            K=cam_K, H=H, W=W,
+            ob_in_cams=ob_in_cam,
+            glctx=self.glctx,
+            mesh_tensors=self.FPModel.mesh_tensors,
+        )
+        depth_r = depth_r[0].detach().cpu().numpy()  # (H, W), meters; 0 = bg
+        return (depth_r > 0).astype(np.uint8) * 255
+
+    def publish_debug_viz(self, rgb: np.ndarray, pose: np.ndarray,
+                          cam_K: np.ndarray):
+        """Publish the FP silhouette (/fp_render_mask) and an RGB overlay
+        (/fp_debug_overlay) comparing the FP silhouette (green) with the SAM2
+        mask (red), plus centroid distance and mask IoU for diagnosis."""
+        H, W = rgb.shape[:2]
+
+        try:
+            fp_sil = self.render_fp_silhouette(pose, cam_K, H, W)
+        except Exception as e:  # rendering must never break the tracking loop
+            self.get_logger().warn(f"Debug render failed: {e}",
+                                   throttle_duration_sec=2.0)
+            return
+
+        # /fp_render_mask — raw FP silhouette
+        try:
+            self.render_mask_pub.publish(
+                self.bridge.cv2_to_imgmsg(fp_sil, encoding="mono8"))
+        except CvBridgeError as e:
+            self.get_logger().warn(f"render_mask publish failed: {e}",
+                                   throttle_duration_sec=2.0)
+
+        # /fp_debug_overlay — RGB with FP silhouette + SAM2 mask overlaid
+        overlay = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
+        fp_bool = fp_sil > 0
+
+        # Translucent green fill for the FP silhouette
+        if fp_bool.any():
+            tint = overlay.copy()
+            tint[fp_bool] = (0, 255, 0)
+            overlay = cv2.addWeighted(overlay, 0.75, tint, 0.25, 0)
+            cnts, _ = cv2.findContours(fp_sil, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 2)
+
+        # SAM2 mask outline in red + centroid distance / IoU text
+        if self.latest_mask is not None and self.latest_mask.shape == (H, W):
+            sam_bool = self.latest_mask > 0
+            sam_u8 = sam_bool.astype(np.uint8) * 255
+            cnts, _ = cv2.findContours(sam_u8, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, cnts, -1, (0, 0, 255), 2)
+
+            # FP projected 3D center (blue) — matches the auto-reset metric
+            t = pose[:3, 3]
+            if t[2] > 0.01:
+                fp_u = int((cam_K[0, 0] * t[0] / t[2]) + cam_K[0, 2])
+                fp_v = int((cam_K[1, 1] * t[1] / t[2]) + cam_K[1, 2])
+                cv2.circle(overlay, (fp_u, fp_v), 5, (255, 0, 0), -1)
+
+                if sam_bool.any():
+                    ys, xs = np.nonzero(sam_bool)
+                    sam_u, sam_v = int(np.mean(xs)), int(np.mean(ys))
+                    cv2.circle(overlay, (sam_u, sam_v), 5, (0, 0, 255), -1)
+                    cv2.line(overlay, (fp_u, fp_v), (sam_u, sam_v),
+                             (255, 255, 0), 1)
+                    dist = float(np.hypot(fp_u - sam_u, fp_v - sam_v))
+
+                    # Silhouette-vs-mask IoU (rotation-sensitive diagnostic)
+                    inter = int(np.logical_and(fp_bool, sam_bool).sum())
+                    union = int(np.logical_or(fp_bool, sam_bool).sum())
+                    iou = inter / union if union > 0 else 0.0
+
+                    cv2.putText(
+                        overlay,
+                        f"center_dist={dist:.1f}px  IoU={iou:.2f}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+
+        try:
+            self.debug_overlay_pub.publish(
+                self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8"))
+        except CvBridgeError as e:
+            self.get_logger().warn(f"debug_overlay publish failed: {e}",
+                                   throttle_duration_sec=2.0)
 
 
 def main(args=None):
