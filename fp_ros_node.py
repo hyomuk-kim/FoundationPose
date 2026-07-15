@@ -450,45 +450,86 @@ class FoundationPoseROS2(Node):
         """Dispatch to the configured reset criterion. Returns True if a reset
         was triggered. Depth-residual mode catches rotation drift that leaves
         the centroid in place; centroid mode is the translation-only fallback."""
+
         if not self.use_auto_reset:
             return False
+
         if self.use_depth_residual_reset:
-            return self._check_reset_depth_residual(rendered_depth,
+            return self._check_reset_depth_residual(pose, cam_K, rendered_depth,
                                                     observed_depth)
+
         return self._check_reset_centroid(pose, cam_K)
 
-    def _check_reset_depth_residual(self, rendered_depth,
-                                    observed_depth) -> bool:
-        """Reset when the median depth residual over co-visible, non-occluded
-        pixels stays above threshold for `auto_reset_patience` frames. Heavy
-        occlusion holds (never resets) so a briefly hidden-but-correct pose is
-        not re-registered on a corrupted observation."""
-        if rendered_depth is None or observed_depth is None:
-            return False
+    def _centroid_distance(self, pose: np.ndarray, cam_K: np.ndarray):
+        """Pixel distance between the SAM2 mask centroid and the projected FP
+        3D center. Returns None if there is no usable mask or the object is
+        behind the camera."""
 
-        residual, n_covis, n_occ = self.compute_depth_residual(
-            rendered_depth, observed_depth)
+        if self.latest_mask is None:
+            return None
 
-        # Too few co-visible pixels or invalid residual -> hold, don't count.
-        if residual is None:
-            return False
+        mask_bool = self.latest_mask > 0
+        if int(mask_bool.sum()) < self.mask_gating_min_pixels:
+            return None
 
-        # Occlusion guard: if most co-visible pixels are occluded the object is
-        # heavily hidden -> hold, decay the counter, never reset this frame.
-        occ_frac = n_occ / max(1, n_covis)
-        if occ_frac > self.depth_residual_heavy_occ_frac:
-            self.drift_counter = max(0, self.drift_counter - 1)
-            return False
+        ys, xs = np.nonzero(mask_bool)
+        mask_u, mask_v = float(np.mean(xs)), float(np.mean(ys))
 
-        if residual > self.depth_residual_thresh_m:
+        t = pose[:3, 3]
+        if t[2] <= 0.01:  # behind the camera
+            return None
+
+        fp_u = (cam_K[0, 0] * t[0] / t[2]) + cam_K[0, 2]
+        fp_v = (cam_K[1, 1] * t[1] / t[2]) + cam_K[1, 2]
+
+        return float(np.hypot(mask_u - fp_u, mask_v - fp_v))
+
+    def _check_reset_depth_residual(self, pose: np.ndarray, cam_K: np.ndarray,
+                                    rendered_depth, observed_depth) -> bool:
+        """Combined reset: depth residual (rotation-sensitive) OR centroid
+        distance (gross divergence safety net). Resets when either votes drift
+        for `auto_reset_patience` frames.
+
+        The occlusion guard only silences the DEPTH vote (a briefly hidden but
+        correct pose has high residual / is mostly occluded). The centroid net
+        stays active so a lost object that drifted away -- which makes the depth
+        residual read n/a -- is still caught. Occlusion is only trusted when the
+        centroid agrees the object is roughly where FP thinks it is."""
+        drift_vote = False
+        reasons = []
+
+        # (A) Centroid safety net -- catches gross divergence even when the
+        # depth residual is n/a (object moved off the rendered silhouette).
+        cdist = self._centroid_distance(pose, cam_K)
+        centroid_far = cdist is not None and cdist > self.max_center_dist_px
+        if centroid_far:
+            drift_vote = True
+            reasons.append(f"center {cdist:.0f}px")
+
+        # (B) Depth residual -- rotation-sensitive, occlusion-gated.
+        residual = None
+        if rendered_depth is not None and observed_depth is not None:
+            residual, n_covis, n_occ = self.compute_depth_residual(
+                rendered_depth, observed_depth)
+            if residual is not None:
+                occ_frac = n_occ / max(1, n_covis)
+                # Trust "heavy occlusion -> hold" only if the centroid agrees the
+                # object is still in place; otherwise it is loss, not occlusion.
+                heavy_occ = occ_frac > self.depth_residual_heavy_occ_frac
+                if heavy_occ and not centroid_far:
+                    pass  # genuinely occluded, do not vote from depth
+                elif residual > self.depth_residual_thresh_m:
+                    drift_vote = True
+                    reasons.append(f"depth {residual*1000:.0f}mm")
+
+        if drift_vote:
             self.drift_counter += 1
         else:
             self.drift_counter = max(0, self.drift_counter - 1)
 
         if self.drift_counter >= self.auto_reset_patience:
             self.get_logger().warn(
-                f"Tracking lost (depth residual: {residual*1000:.1f}mm, "
-                f"occ: {occ_frac*100:.0f}%). Auto-reset triggered.")
+                f"Tracking lost ({', '.join(reasons)}). Auto-reset triggered.")
             self.is_object_registered = False
             self.drift_counter = 0
             return True
@@ -502,27 +543,9 @@ class FoundationPoseROS2(Node):
         2D projection of the FoundationPose 3D center. Triggers a reset if lost.
         Returns True if a reset was triggered, False otherwise.
         """
-        if self.latest_mask is None:
+        dist = self._centroid_distance(pose, cam_K)
+        if dist is None:
             return False
-
-        mask_bool = self.latest_mask > 0
-        if int(mask_bool.sum()) < self.mask_gating_min_pixels:
-            return False
-
-        # Compute the 2D centroid of the SAM2 mask
-        ys, xs = np.nonzero(mask_bool)
-        mask_u, mask_v = float(np.mean(xs)), float(np.mean(ys))
-
-        # Project the FoundationPose 3D center to 2D image space
-        t = pose[:3, 3]
-        if t[2] <= 0.01:  # Prevent division by zero if behind the camera
-            return False
-
-        fp_u = (cam_K[0, 0] * t[0] / t[2]) + cam_K[0, 2]
-        fp_v = (cam_K[1, 1] * t[1] / t[2]) + cam_K[1, 2]
-
-        # Calculate Euclidean pixel distance
-        dist = np.linalg.norm([mask_u - fp_u, mask_v - fp_v])
 
         # Update drift counter
         if dist > self.max_center_dist_px:
