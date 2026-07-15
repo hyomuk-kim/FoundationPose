@@ -122,7 +122,8 @@ Click the object once when the window appears. Once `Mask initialized` prints, t
 Optional mask check (new terminal):
 ```bash
 conda activate my
-ros2 run rqt_image_view rqt_image_view   # select /sam2_mask from the dropdown
+ros2 run rqt_image_view rqt_image_view   
+# Then, select /sam2_mask, /fp_render_mask, /fp_depth_residual, or /fp_debug_overlay from the dropdown
 ```
  
 **Terminal 3 — FoundationPose**
@@ -135,7 +136,17 @@ python3 fp_ros_node.py --ros-args \
 ```
 `self.diameter:0.12...` in the init log confirms the mm→m mesh conversion applied (pre-conversion it reads ~120.5). Once a mask arrives, registration runs, then tracking starts and `Tracking done in NN ms` repeats.
  
-**Terminal 4 — Check output**
+**Terminal 4 — TF frame broadcast**
+```bash
+conda activate my
+cd ~/workspace/FoundationPose
+python3 fp_tf_broadcaster.py --ros-args \
+    -p npz_path:=camera_036322250488_extrinsics.npz \
+    -p robot_frame:=xarm_device \
+    -p camera_frame:=fp_camera_color_optical_frame
+```
+
+**Terminal 5 — Check output (Optional)**
 ```bash
 conda activate my
 ros2 topic hz /object_pose
