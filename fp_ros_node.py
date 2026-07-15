@@ -65,9 +65,28 @@ class FoundationPoseROS2(Node):
 
         # Auto-reset parameters for spatial drift detection
         self.use_auto_reset = True
-        self.auto_reset_patience = 3       # Consecutive frames required to trigger reset
+        self.auto_reset_patience = 3  # Consecutive frames required to trigger reset
         self.drift_counter = 0
-        self.max_center_dist_px = 30.0     # Max pixel distance between SAM2 and FP centers
+        self.max_center_dist_px = 30.0  # Max pixel distance between SAM2 and FP centers
+
+        # Reset mode: centroid distance (translation-only) vs depth residual.
+        # Depth residual compares the FP-rendered depth against observed depth
+        # over co-visible, non-occluded pixels, so it also catches rotation
+        # drift that leaves the centroid in place. Toggle at launch with
+        # -p use_depth_residual_reset:=false to fall back to centroid mode.
+        self.declare_parameter("use_depth_residual_reset", True)
+        self.use_depth_residual_reset = self.get_parameter(
+            "use_depth_residual_reset").get_parameter_value().bool_value
+        self.declare_parameter("depth_residual_thresh_m", 0.015)
+        self.depth_residual_thresh_m = self.get_parameter(
+            "depth_residual_thresh_m").get_parameter_value().double_value
+        # Min co-visible pixels for a valid residual (else hold, don't count).
+        self.depth_residual_min_covisible_px = 200
+        # Observed depth this much closer than rendered => an occluder in front.
+        self.depth_residual_occlusion_margin_m = 0.03
+        # If more than this fraction of co-visible pixels are occluded, the
+        # object is heavily occluded => hold, never reset on this frame.
+        self.depth_residual_heavy_occ_frac = 0.6
 
         # Refinement iterations
         self.first_est_refine_iter = 5  # Higher quality for first registration
@@ -154,10 +173,13 @@ class FoundationPoseROS2(Node):
         self.pose_pub = self.create_publisher(PoseStamped, "/object_pose", 1)
 
         # Debug-viz publishers: FP silhouette mask + RGB overlay (view in rqt).
-        self.render_mask_pub = self.create_publisher(
-            ROSImage, "/fp_render_mask", 1)
-        self.debug_overlay_pub = self.create_publisher(
-            ROSImage, "/fp_debug_overlay", 1)
+        self.render_mask_pub = self.create_publisher(ROSImage,
+                                                     "/fp_render_mask", 1)
+        self.debug_overlay_pub = self.create_publisher(ROSImage,
+                                                       "/fp_debug_overlay", 1)
+        # Colorized |z_render - z_obs| heatmap over co-visible pixels.
+        self.depth_residual_pub = self.create_publisher(ROSImage,
+                                                        "/fp_depth_residual", 1)
 
         # Timer-driven main loop (runs as fast as GPU allows)
         self.timer = self.create_timer(0.01, self.run_once)
@@ -248,11 +270,11 @@ class FoundationPoseROS2(Node):
     def _track(self):
         """Frame-to-frame tracking."""
         rgb = self.process_rgb(self.latest_rgb)
-        depth = self.process_depth(self.latest_depth)
+        depth_obs = self.process_depth(self.latest_depth)  # ungated observation
         cam_K = self.latest_cam_K.copy()
 
         # Mask-gate depth + apply constant-velocity prior before tracking.
-        depth = self.gate_depth_by_mask(depth)
+        depth = self.gate_depth_by_mask(depth_obs)
         self.apply_cv_prior()
 
         t0 = time.time()
@@ -263,12 +285,21 @@ class FoundationPoseROS2(Node):
         elapsed_ms = (time.time() - t0) * 1000
         self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
 
+        # Render the FP depth once and reuse it for both debug viz and the
+        # depth-residual reset (avoids rendering the mesh twice per frame).
+        H, W = depth_obs.shape
+        rendered_depth = None
+        need_render = self.debug_viz or (self.use_auto_reset and
+                                         self.use_depth_residual_reset)
+        if need_render:
+            rendered_depth = self.render_fp_depth(pose, cam_K, H, W)
+
         # Publish debug viz before the reset check so borderline / stuck frames
         # (which do NOT trigger a reset) are still inspectable in rqt.
         if self.debug_viz:
-            self.publish_debug_viz(rgb, pose, cam_K)
+            self.publish_debug_viz(rgb, pose, cam_K, depth_obs, rendered_depth)
 
-        if self.check_auto_reset(pose, cam_K):
+        if self.check_auto_reset(pose, cam_K, depth_obs, rendered_depth):
             return  # Abort publishing this frame and re-register next frame
 
         self.update_cv_prior_history()
@@ -409,15 +440,69 @@ class FoundationPoseROS2(Node):
             return
         self.pose_last_prev = pose_last.detach().cpu().numpy().reshape(4, 4)
 
-    # ---------- auto-reset with centroid distance ----------
+    # ---------- auto-reset ----------
 
-    def check_auto_reset(self, pose: np.ndarray, cam_K: np.ndarray) -> bool:
+    def check_auto_reset(self,
+                         pose: np.ndarray,
+                         cam_K: np.ndarray,
+                         observed_depth: np.ndarray = None,
+                         rendered_depth=None) -> bool:
+        """Dispatch to the configured reset criterion. Returns True if a reset
+        was triggered. Depth-residual mode catches rotation drift that leaves
+        the centroid in place; centroid mode is the translation-only fallback."""
+        if not self.use_auto_reset:
+            return False
+        if self.use_depth_residual_reset:
+            return self._check_reset_depth_residual(rendered_depth,
+                                                    observed_depth)
+        return self._check_reset_centroid(pose, cam_K)
+
+    def _check_reset_depth_residual(self, rendered_depth,
+                                    observed_depth) -> bool:
+        """Reset when the median depth residual over co-visible, non-occluded
+        pixels stays above threshold for `auto_reset_patience` frames. Heavy
+        occlusion holds (never resets) so a briefly hidden-but-correct pose is
+        not re-registered on a corrupted observation."""
+        if rendered_depth is None or observed_depth is None:
+            return False
+
+        residual, n_covis, n_occ = self.compute_depth_residual(
+            rendered_depth, observed_depth)
+
+        # Too few co-visible pixels or invalid residual -> hold, don't count.
+        if residual is None:
+            return False
+
+        # Occlusion guard: if most co-visible pixels are occluded the object is
+        # heavily hidden -> hold, decay the counter, never reset this frame.
+        occ_frac = n_occ / max(1, n_covis)
+        if occ_frac > self.depth_residual_heavy_occ_frac:
+            self.drift_counter = max(0, self.drift_counter - 1)
+            return False
+
+        if residual > self.depth_residual_thresh_m:
+            self.drift_counter += 1
+        else:
+            self.drift_counter = max(0, self.drift_counter - 1)
+
+        if self.drift_counter >= self.auto_reset_patience:
+            self.get_logger().warn(
+                f"Tracking lost (depth residual: {residual*1000:.1f}mm, "
+                f"occ: {occ_frac*100:.0f}%). Auto-reset triggered.")
+            self.is_object_registered = False
+            self.drift_counter = 0
+            return True
+
+        return False
+
+    def _check_reset_centroid(self, pose: np.ndarray,
+                              cam_K: np.ndarray) -> bool:
         """
         Detects spatial drift by comparing the SAM2 mask centroid with the
         2D projection of the FoundationPose 3D center. Triggers a reset if lost.
         Returns True if a reset was triggered, False otherwise.
         """
-        if not self.use_auto_reset or self.latest_mask is None:
+        if self.latest_mask is None:
             return False
 
         mask_bool = self.latest_mask > 0
@@ -456,38 +541,71 @@ class FoundationPoseROS2(Node):
 
         return False
 
+    # ---------- FP mesh rendering + depth residual ----------
+
+    def render_fp_depth(self, pose: np.ndarray, cam_K: np.ndarray, H: int,
+                        W: int):
+        """Render the FP mesh at the tracked pose and return its depth map
+        (float32, meters; 0 = background). Uses the SAME centered mesh_tensors
+        and pose_last convention the refiner compares against internally, so it
+        reflects exactly what FoundationPose "sees" as the object. Returns None
+        on failure so the tracking loop is never broken by rendering."""
+        try:
+            ob_in_cam = torch.as_tensor(pose.reshape(1, 4, 4),
+                                        device="cuda",
+                                        dtype=torch.float)
+            _, depth_r, _ = nvdiffrast_render(
+                K=cam_K,
+                H=H,
+                W=W,
+                ob_in_cams=ob_in_cam,
+                glctx=self.glctx,
+                mesh_tensors=self.FPModel.mesh_tensors,
+            )
+            return depth_r[0].detach().cpu().numpy()  # (H, W), meters; 0 = bg
+        except Exception as e:  # rendering must never break the tracking loop
+            self.get_logger().warn(f"FP depth render failed: {e}",
+                                   throttle_duration_sec=2.0)
+            return None
+
+    def compute_depth_residual(self, rendered_depth: np.ndarray,
+                               observed_depth: np.ndarray):
+        """Median |z_render - z_obs| over co-visible, non-occluded pixels.
+        A pixel is co-visible when both rendered and observed depth are valid;
+        an occluder is detected when the observation is clearly closer than the
+        rendered object surface, and those pixels are excluded from the residual.
+        Returns (residual_m or None, n_covisible, n_occluded)."""
+        covis = (rendered_depth > 0) & (observed_depth > 0)
+        n_covis = int(covis.sum())
+        if n_covis < self.depth_residual_min_covisible_px:
+            return None, n_covis, 0
+
+        diff = observed_depth[covis] - rendered_depth[covis]
+        occluded = diff < -self.depth_residual_occlusion_margin_m
+        n_occ = int(occluded.sum())
+
+        inliers = ~occluded
+        if int(inliers.sum()) < self.depth_residual_min_covisible_px:
+            return None, n_covis, n_occ
+
+        residual = float(np.median(np.abs(diff[inliers])))
+        return residual, n_covis, n_occ
+
     # ---------- debug visualization ----------
 
-    def render_fp_silhouette(self, pose: np.ndarray, cam_K: np.ndarray,
-                             H: int, W: int) -> np.ndarray:
-        """Render the FP mesh at the tracked pose and return its binary
-        silhouette (uint8, 0/255). Uses the SAME centered mesh_tensors and
-        pose_last convention the refiner compares against internally, so the
-        result reflects exactly what FoundationPose "sees" as the object."""
-        ob_in_cam = torch.as_tensor(
-            pose.reshape(1, 4, 4), device="cuda", dtype=torch.float)
-        _, depth_r, _ = nvdiffrast_render(
-            K=cam_K, H=H, W=W,
-            ob_in_cams=ob_in_cam,
-            glctx=self.glctx,
-            mesh_tensors=self.FPModel.mesh_tensors,
-        )
-        depth_r = depth_r[0].detach().cpu().numpy()  # (H, W), meters; 0 = bg
-        return (depth_r > 0).astype(np.uint8) * 255
-
     def publish_debug_viz(self, rgb: np.ndarray, pose: np.ndarray,
-                          cam_K: np.ndarray):
-        """Publish the FP silhouette (/fp_render_mask) and an RGB overlay
+                          cam_K: np.ndarray, observed_depth: np.ndarray,
+                          rendered_depth):
+        """Publish the FP silhouette (/fp_render_mask), an RGB overlay
         (/fp_debug_overlay) comparing the FP silhouette (green) with the SAM2
-        mask (red), plus centroid distance and mask IoU for diagnosis."""
-        H, W = rgb.shape[:2]
-
-        try:
-            fp_sil = self.render_fp_silhouette(pose, cam_K, H, W)
-        except Exception as e:  # rendering must never break the tracking loop
-            self.get_logger().warn(f"Debug render failed: {e}",
-                                   throttle_duration_sec=2.0)
+        mask (red), and a colorized depth-residual heatmap (/fp_depth_residual).
+        Overlays centroid distance, mask IoU, and depth residual for diagnosis."""
+        if rendered_depth is None:
             return
+
+        H, W = rendered_depth.shape
+        fp_sil = (rendered_depth > 0).astype(np.uint8) * 255
+        fp_bool = fp_sil > 0
 
         # /fp_render_mask — raw FP silhouette
         try:
@@ -499,7 +617,6 @@ class FoundationPoseROS2(Node):
 
         # /fp_debug_overlay — RGB with FP silhouette + SAM2 mask overlaid
         overlay = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
-        fp_bool = fp_sil > 0
 
         # Translucent green fill for the FP silhouette
         if fp_bool.any():
@@ -518,7 +635,7 @@ class FoundationPoseROS2(Node):
                                        cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(overlay, cnts, -1, (0, 0, 255), 2)
 
-            # FP projected 3D center (blue) — matches the auto-reset metric
+            # FP projected 3D center (blue) — matches the centroid reset metric
             t = pose[:3, 3]
             if t[2] > 0.01:
                 fp_u = int((cam_K[0, 0] * t[0] / t[2]) + cam_K[0, 2])
@@ -532,23 +649,51 @@ class FoundationPoseROS2(Node):
                     cv2.line(overlay, (fp_u, fp_v), (sam_u, sam_v),
                              (255, 255, 0), 1)
                     dist = float(np.hypot(fp_u - sam_u, fp_v - sam_v))
-
-                    # Silhouette-vs-mask IoU (rotation-sensitive diagnostic)
                     inter = int(np.logical_and(fp_bool, sam_bool).sum())
                     union = int(np.logical_or(fp_bool, sam_bool).sum())
                     iou = inter / union if union > 0 else 0.0
+                    cv2.putText(overlay,
+                                f"center_dist={dist:.1f}px  IoU={iou:.2f}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (255, 255, 255), 2, cv2.LINE_AA)
 
-                    cv2.putText(
-                        overlay,
-                        f"center_dist={dist:.1f}px  IoU={iou:.2f}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2, cv2.LINE_AA)
+        # Depth residual text (independent of SAM2)
+        residual, n_covis, n_occ = self.compute_depth_residual(
+            rendered_depth, observed_depth)
+        if residual is not None:
+            occ_frac = n_occ / max(1, n_covis)
+            txt = (f"depth_res={residual*1000:.1f}mm  "
+                   f"occ={occ_frac*100:.0f}%  covis={n_covis}")
+        else:
+            txt = "depth_res=n/a (low covis / heavy occ)"
+        cv2.putText(overlay, txt, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 255), 2, cv2.LINE_AA)
 
         try:
             self.debug_overlay_pub.publish(
                 self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8"))
         except CvBridgeError as e:
             self.get_logger().warn(f"debug_overlay publish failed: {e}",
+                                   throttle_duration_sec=2.0)
+
+        # /fp_depth_residual — colorized |z_render - z_obs| over co-visible px.
+        # Non co-visible = black; excluded occluders = white. Display is capped
+        # at 3x the reset threshold so the useful range is well spread.
+        covis = (rendered_depth > 0) & (observed_depth > 0)
+        diff = observed_depth - rendered_depth
+        cap = max(self.depth_residual_thresh_m * 3.0, 1e-6)
+        norm = np.clip(np.abs(diff) / cap, 0.0, 1.0)
+        heat = np.zeros((H, W), np.uint8)
+        heat[covis] = (norm[covis] * 255).astype(np.uint8)
+        heat_color = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+        heat_color[~covis] = (0, 0, 0)
+        occluded = covis & (diff < -self.depth_residual_occlusion_margin_m)
+        heat_color[occluded] = (255, 255, 255)
+        try:
+            self.depth_residual_pub.publish(
+                self.bridge.cv2_to_imgmsg(heat_color, encoding="bgr8"))
+        except CvBridgeError as e:
+            self.get_logger().warn(f"depth_residual publish failed: {e}",
                                    throttle_duration_sec=2.0)
 
 
