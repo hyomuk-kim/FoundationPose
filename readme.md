@@ -91,13 +91,14 @@ conda deactivate
 source /opt/ros/jazzy/setup.bash
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml
- 
+
+# Make sure you use the usb 3.0 cables!
 ros2 launch realsense2_camera rs_launch.py \
     align_depth.enable:=true \
     camera_namespace:=/ \
     camera_name:=camera \
-    rgb_camera.color_profile:=640x480x30 \
-    depth_module.depth_profile:=640x480x30
+    rgb_camera.color_profile:=848x480x30 \
+    depth_module.depth_profile:=848x480x30
 ```
  
 Check (`ros2 topic hz` gives false readings due to QoS mismatch — use echo'd timestamp intervals instead; 0.033s = 30Hz):
